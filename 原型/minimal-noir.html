@@ -1,0 +1,106 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>ZPowerPack · 极简黑金</title>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@600;700&family=Chakra+Petch:wght@500;600;700&family=Manrope:wght@400;500;700;800&display=swap" rel="stylesheet">
+<style>
+*{margin:0;box-sizing:border-box}::selection{background:rgba(212,165,49,.28)}
+body{width:1440px;height:900px;overflow:hidden;background:#0a0a0c;color:#ece8df;font:14px/1.5 Manrope,"Microsoft YaHei",sans-serif;display:flex;flex-direction:column;position:relative}
+body::before{content:"";position:absolute;inset:0;background:radial-gradient(46% 34% at 30% 12%,rgba(212,165,49,.08),transparent 60%),radial-gradient(40% 30% at 85% 90%,rgba(212,165,49,.05),transparent 60%);pointer-events:none}
+.top{height:60px;display:flex;align-items:center;gap:26px;padding:0 36px;border-bottom:1px solid rgba(212,165,49,.22);position:relative}
+.top::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:1px;background:linear-gradient(90deg,transparent,rgba(212,165,49,.7),transparent);background-size:200% 100%;animation:gilt 6s linear infinite}
+@keyframes gilt{to{background-position:-200% 0}}
+.brand{font:700 17px "Noto Serif SC",serif;letter-spacing:.14em;color:#f0e6cf}.brand b{color:#d4a531}
+.tabs{display:flex;gap:22px;margin-left:auto}.tab{font-size:13px;color:#8d8574;padding:6px 2px;letter-spacing:.06em}.tab.on{color:#d4a531;border-bottom:1px solid #d4a531}
+.live{font-size:12px;color:#8d8574}.live i{display:inline-block;width:7px;height:7px;border-radius:50%;background:#d4a531;box-shadow:0 0 10px rgba(212,165,49,.8);margin-right:7px;vertical-align:-1px}
+.main{flex:1;display:flex;flex-direction:column;padding:0 36px;min-height:0}
+.stage{display:flex;align-items:flex-end;gap:44px;padding:30px 0 22px;border-bottom:1px solid rgba(212,165,49,.14)}
+.stage .num{font:800 118px/0.86 "Chakra Petch";letter-spacing:-.03em;font-variant-numeric:tabular-nums;color:#f5ecd7}
+.stage .meta{padding-bottom:14px}
+.stage .meta .u{font:600 15px "Chakra Petch";color:#8d8574;letter-spacing:.08em}
+.stage .meta .sub{margin-top:10px;font-size:13px;color:#8d8574}
+.stage .meta .sub b{color:#ece8df;font:700 16px "Chakra Petch";font-variant-numeric:tabular-nums;margin-right:14px}
+.badge{display:inline-flex;gap:7px;align-items:center;border:1px solid rgba(212,165,49,.5);color:#d4a531;border-radius:999px;padding:5px 14px;font-size:12px;font-weight:700;margin-top:12px}
+.windows{padding:20px 0;border-bottom:1px solid rgba(212,165,49,.14)}
+.lead{display:flex;align-items:baseline;gap:14px;margin-bottom:14px}
+.lead h3{font:700 17px "Noto Serif SC",serif;color:#f0e6cf;letter-spacing:.1em}
+.lead .q{font-size:12.5px;color:#8d8574}
+.wgrp{display:grid;grid-template-columns:1.2fr 1fr 1.6fr;gap:18px}
+.grp{border:1px solid rgba(212,165,49,.2);border-radius:4px;padding:13px 16px;position:relative}
+.grp .gname{font-size:12.5px;color:#c9bfa6;letter-spacing:.06em;display:flex;justify-content:space-between}
+.grp .gname .src{color:#8d8574;font-size:10.5px}
+.winrow{margin-top:10px}
+.winrow .wl{display:flex;justify-content:space-between;font-size:11.5px;color:#8d8574;margin-bottom:4px}
+.winrow .wl b{color:#ece8df;font:700 12px "Chakra Petch";font-variant-numeric:tabular-nums}
+.wbar{height:5px;background:rgba(212,165,49,.12);overflow:hidden;border-radius:2px}
+.wbar i{display:block;height:100%;border-radius:2px;background:linear-gradient(90deg,#a47b1f,#d4a531);box-shadow:0 0 8px rgba(212,165,49,.35)}
+.wbar i.hot{background:linear-gradient(90deg,#d4a531,#e8c96a)}
+.wrowft{display:flex;justify-content:space-between;font-size:10.5px;color:#6d6656;margin-top:4px}
+.charts{flex:1;display:grid;grid-template-columns:1.25fr 1fr 1.15fr 1fr;gap:26px;padding:18px 0 0;min-height:0}
+.cx{border-top:1px solid rgba(212,165,49,.18);padding-top:12px;display:flex;flex-direction:column;min-height:0}
+.cx h4{font:700 15px "Noto Serif SC",serif;color:#f0e6cf;letter-spacing:.06em}
+.cx .q{font-size:11.5px;color:#8d8574;margin:4px 0 10px}
+.hb{display:flex;flex-direction:column;gap:8px}
+.hb .r{display:grid;grid-template-columns:92px 1fr 60px;gap:8px;align-items:center;font-size:11px;color:#8d8574}
+.hb .r b{color:#ece8df;text-align:right;font-variant-numeric:tabular-nums}
+.bar{height:4px;background:rgba(212,165,49,.14);position:relative}
+.bar i{position:absolute;inset:0 auto 0 0;background:#d4a531}
+.bar em{position:absolute;top:-2.5px;width:1.5px;height:9px;background:rgba(236,232,223,.6)}
+.hist{display:flex;align-items:flex-end;gap:5px;flex:1;min-height:56px}
+.hist i{flex:1;background:linear-gradient(180deg,rgba(212,165,49,.85),rgba(212,165,49,.12))}
+.dots{position:relative;flex:1;min-height:56px}
+.dots i{position:absolute;width:6px;height:6px;border-radius:50%;background:#d4a531}
+.dots em{position:absolute;left:2%;top:80%;width:94%;border-top:1px solid rgba(212,165,49,.4);transform:rotate(6deg);transform-origin:left}
+.foot{font-size:10.5px;color:#6d6656;margin-top:8px}
+.dock{height:46px;border-top:1px solid rgba(212,165,49,.22);display:flex;align-items:center;gap:20px;padding:0 36px;background:#0c0c0e;margin-top:14px}
+.dock .k{font:600 10px "Chakra Petch";letter-spacing:.2em;color:#6d6656}
+.dock b{font:700 16px "Chakra Petch";color:#d4a531;font-variant-numeric:tabular-nums}
+.dock .cur{font-size:12px;color:#c9bfa6}.dock .cur b{color:#f0e6cf;font-family:Manrope;margin-right:4px}
+.dock .q{display:flex;align-items:center;gap:7px;font-size:11.5px;color:#8d8574}.dock .q .wbar{width:52px}
+</style></head><body>
+<div class="top"><span class="brand">Z<b>Power</b>Pack</span>
+<div class="tabs"><span class="tab on">今日</span><span class="tab">7 天</span><span class="tab">30 天</span></div>
+<span class="live"><i></i>实时 · 数据时刻 16:42:07</span></div>
+<div class="main">
+<div class="stage"><span class="num">428.6</span>
+<div class="meta"><div class="u">tok/s · 每秒生成的 token 数</div>
+<div class="sub"><b>主 312.4</b><b>子代理 116.2</b>最近 60 秒</div>
+<div class="badge">⏸ 保持上次速度 · 数据时刻 16:42:07</div></div></div>
+<div class="windows">
+<div class="lead"><h3>额度水位</h3><span class="q">各窗口还能用多少？多久恢复？（智谱 5h+周 · Kimi 5h+月 · OpenCode 5h+周+月）</span></div>
+<div class="wgrp">
+<div class="grp"><div class="gname"><span>智谱 GLM Coding</span><span class="src">官方余量</span></div>
+<div class="winrow"><div class="wl"><span>5 小时窗口</span><b>45%</b></div><div class="wbar"><i style="width:45%"></i></div><div class="wrowft"><span>2h12m 后重置</span><span>今天 12:00 起</span></div></div>
+<div class="winrow"><div class="wl"><span>本周额度</span><b>12%</b></div><div class="wbar"><i style="width:12%"></i></div><div class="wrowft"><span>周一 00:00 重置</span><span>已用 3 天</span></div></div></div>
+<div class="grp"><div class="gname"><span>Kimi Code</span><span class="src">官方余量</span></div>
+<div class="winrow"><div class="wl"><span>5 小时窗口</span><b>62%</b></div><div class="wbar"><i class="hot" style="width:62%"></i></div><div class="wrowft"><span>3h05m 后重置</span><span>偏快 · 留意</span></div></div>
+<div class="winrow"><div class="wl"><span>本月额度</span><b>34%</b></div><div class="wbar"><i style="width:34%"></i></div><div class="wrowft"><span>订阅日 11-08 重置</span><span>剩 17 天</span></div></div></div>
+<div class="grp"><div class="gname"><span>OpenCode Go</span><span class="src">你已配置分母</span></div>
+<div class="winrow"><div class="wl"><span>5 小时窗口</span><b>38%</b></div><div class="wbar"><i style="width:38%"></i></div><div class="wrowft"><span>1h40m 后重置</span><span></span></div></div>
+<div class="winrow"><div class="wl"><span>本周额度</span><b>57%</b></div><div class="wbar"><i class="hot" style="width:57%"></i></div><div class="wrowft"><span>周一重置</span><span>偏快 · 留意</span></div></div>
+<div class="winrow"><div class="wl"><span>本月额度</span><b>28%</b></div><div class="wbar"><i style="width:28%"></i></div><div class="wrowft"><span>订阅日 11-01 重置</span><span>剩 19 天</span></div></div></div>
+</div></div>
+<div class="charts">
+<div class="cx"><h4>模型速度对比</h4><div class="q">哪家模型平时吐字快？慢起来会多慢？</div>
+<div class="hb">
+<div class="r"><span>GLM-5.3</span><span class="bar"><i style="width:33%"></i><em style="left:50%"></em></span><b>108/165</b></div>
+<div class="r"><span>kimi-k3.1-pro</span><span class="bar"><i style="width:29%"></i><em style="left:42%"></em></span><b>96/140</b></div>
+<div class="r"><span>GLM-Flash</span><span class="bar"><i style="width:27%"></i><em style="left:36%"></em></span><b>88.7/120</b></div>
+<div class="r"><span>qwen3.8-max</span><span class="bar"><i style="width:19%"></i><em style="left:27%"></em></span><b>61.5/90</b></div>
+</div><div class="foot">金条=典型速度 · 白刻度=慢的时候</div></div>
+<div class="cx"><h4>首字等待</h4><div class="q">按下发送后，要等多久才蹦出第一个字？</div>
+<div class="hist"><i style="height:30%"></i><i style="height:56%"></i><i style="height:84%"></i><i style="height:60%"></i><i style="height:42%"></i><i style="height:24%"></i><i style="height:12%"></i><i style="height:7%"></i><i style="height:32%"></i><i style="height:50%"></i></div>
+<div class="foot">多数 1–2 秒 · 最慢约 5.2 秒</div></div>
+<div class="cx"><h4>对话越长会变慢吗</h4><div class="q">上下文变大时的速度变化</div>
+<div class="dots"><i style="left:4%;top:24%"></i><i style="left:14%;top:32%"></i><i style="left:26%;top:28%"></i><i style="left:38%;top:44%"></i><i style="left:50%;top:50%"></i><i style="left:62%;top:46%"></i><i style="left:74%;top:58%"></i><i style="left:86%;top:64%"></i><i style="left:94%;top:70%"></i><em></em></div>
+<div class="foot">接近上限时约降 18%</div></div>
+<div class="cx"><h4>谁家更不容易翻车</h4><div class="q">失败与自动重试的比例 · 近 7 天</div>
+<div class="hb">
+<div class="r"><span>bigmodel-api</span><span class="bar"><i style="width:4%"></i></span><b>0.4%</b></div>
+<div class="r"><span>kimi-code-cn</span><span class="bar"><i style="width:9%"></i></span><b>0.9%</b></div>
+<div class="r"><span>opencode-go</span><span class="bar"><i style="width:23%"></i></span><b>2.3%</b></div>
+</div><div class="foot">失败率 · 悬停看重试与错误类型</div></div>
+</div>
+</div>
+<div class="dock"><span class="k">迷你常驻态</span><span class="cur">当前会话：<b>bigmodel-api</b></span><b>428.6 tok/s</b>
+<span class="q">5h<span class="wbar"><i style="width:45%"></i></span>45%</span>
+<span class="q">周<span class="wbar"><i style="width:12%"></i></span>12%</span>
+<span style="margin-left:auto;font-size:11px;color:#6d6656">跟随会话所选厂商 · 可在设置锁定</span></div>
+</body></html>

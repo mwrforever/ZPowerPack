@@ -1,0 +1,8 @@
+{
+  "name": "zpowerpack",
+  "version": "0.1.0",
+  "description": "ZPowerPack：zcode 存储迁移向导与用量看板——实时 token 速率、套餐额度窗口、速度/健康/时段统计，桌面端原生内嵌展示。",
+  "author": { "name": "ZPowerPack" },
+  "license": "MIT",
+  "skills": "skills"
+}

@@ -1,0 +1,11 @@
+{
+  "name": "zpowerpack",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ZPowerPack 插件源码工程：存储迁移向导 + 用量看板（测试与 lint 用）",
+  "scripts": {
+    "test": "node --test tests/",
+    "lint": "node scripts/lint.mjs"
+  }
+}
