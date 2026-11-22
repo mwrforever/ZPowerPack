@@ -194,3 +194,22 @@ test("cleanup：manifest 缺失时中文报错且不删除", async () => {
     return true;
   });
 });
+
+test("cleanup：当前 zcode 配置仍指向待删根时拒绝清理（护栏：live 根 ≠ 旧根才允许）", async () => {
+  // 迁移真跑后，把当前 config 的 storage 两键改回指向旧根（模拟"配置被改回/未生效"的危险场景）
+  const env0 = makeMigrationEnv();
+  const r = await runMigration({ target: env0.target, skipWaiter: true, homedir: env0.home });
+  writeFileSync(
+    env0.configPath,
+    JSON.stringify({ storage: { dir: env0.oldCliRoot.replace(/\\cli$/, "") }, theme: "dark" }, null, 2) + "\n",
+    "utf8",
+  );
+  await assert.rejects(
+    () => cleanupOldData({ manifestPath: r.manifestPath, confirmFn: async () => true, homedir: env0.home }),
+    (e) => {
+      assert.ok(e.message.includes("仍在使用"), "应拒绝仍在使用的根: " + e.message);
+      return true;
+    },
+  );
+  assert.equal(existsSync(join(env0.oldCliRoot, "rollout")), true, "拒绝后源数据必须保留");
+});

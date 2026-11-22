@@ -29,6 +29,8 @@ export function initManifest(backupRoot, opts) {
   const manifest = {
     startedAt: new Date().toISOString(),
     targetRoot: opts.targetRoot,
+    // 迁移时的实际源根（cleanup 的权威依据；快照反推仅作旧 manifest 兜底）
+    sourceRoot: typeof opts.sourceRoot === "string" ? opts.sourceRoot : null,
     phases: [],
     configSnapshot: null,
     copied: [],

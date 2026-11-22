@@ -107,8 +107,8 @@ export async function runMigration(opts) {
     return { manifestPath: null, copied: [] };
   }
 
-  // manifest 是恢复能力的依据：从这里开始每个阶段即时落盘
-  const manifestPath = initManifest(backupRoot, { targetRoot: target });
+  // manifest 是恢复能力的依据：从这里开始每个阶段即时落盘（sourceRoot 记录实际源根，cleanup 权威依据）
+  const manifestPath = initManifest(backupRoot, { targetRoot: target, sourceRoot: oldCliRoot });
 
   // 空间闸门：先建目标目录再实测目标卷可用空间
   mkdirSync(target, { recursive: true });
@@ -226,15 +226,27 @@ function oldCliRootFromSnapshot(configSnapshot, homedir) {
  * @throws {Error} manifest 缺失/源根与目标根相同/确认被拒绝
  */
 export async function cleanupOldData(opts) {
-  const { manifestPath, confirmFn, log = (line) => console.log(line), homedir = defaultHomedir() } = opts;
+  const { manifestPath, confirmFn, log = (line) => console.log(line), homedir = defaultHomedir(), env = process.env } = opts;
   const manifest = readManifest(manifestPath); // 缺失时抛「manifest 不存在」
-  const oldRoot = oldCliRootFromSnapshot(manifest.configSnapshot, homedir);
+  // 旧根优先取迁移时记录的实际源根；旧 manifest 无该字段时按 configSnapshot 反推（默认根语义）
+  const oldRoot =
+    typeof manifest.sourceRoot === "string" && manifest.sourceRoot.trim().length > 0
+      ? manifest.sourceRoot
+      : oldCliRootFromSnapshot(manifest.configSnapshot, homedir);
   const newCliRoot = join(manifest.targetRoot, "cli");
   if (oldRoot === newCliRoot || oldRoot === manifest.targetRoot) {
     throw new Error(`源根 ${oldRoot} 与迁移目标相同，拒绝清理（防误删新数据）`);
   }
   if (!Array.isArray(manifest.copied) || manifest.copied.length === 0) {
     throw new Error("manifest 未记录任何已复制条目，拒绝清理");
+  }
+  // 护栏：当前 zcode 配置仍指向旧根（storage 两键未生效或被改回）时，旧根是活数据，绝对不可清理
+  const liveRoot = resolveCliStorageRoot(env, homedir);
+  if (liveRoot === oldRoot) {
+    throw new Error(
+      `当前 zcode 配置仍在使用 ${oldRoot} 作为存储根（storage 两键未生效或已被改回）。` +
+        `清理仅在 zcode 已运行于新存储（storage.dir 指向 ${manifest.targetRoot}）且验收通过后进行。已拒绝，未删除任何内容。`,
+    );
   }
 
   const targets = manifest.copied.map((name) => ({ name, path: join(oldRoot, name) }));
@@ -283,12 +295,17 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       console.error("用法: node scripts/migrate/main.mjs cleanup --manifest <manifest 路径>");
       process.exit(2);
     }
-    // 交互式双重确认：readline 输入 y 才视为通过
+    // 交互式双重确认：行迭代器逐次取答案（question() 连续调用在管道输入下会丢行，Node 24 实测）
     const { createInterface } = await import("node:readline/promises");
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
-    const confirmFn = async () => (await rl.question("确认？(y/N) ")).trim().toLowerCase() === "y";
+    const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: false });
+    const lines = rl[Symbol.asyncIterator]();
+    const confirmFn = async () => {
+      process.stdout.write("确认？(y/N) ");
+      const { value } = await lines.next();
+      return String(value ?? "").trim().toLowerCase() === "y";
+    };
     try {
-      await cleanupOldData({ manifestPath, confirmFn, log });
+      await cleanupOldData({ manifestPath, confirmFn, log, homedir: get("--home") ?? defaultHomedir() });
       process.exit(0);
     } catch (e) {
       console.error(`清理中止：${e.message}`);
@@ -309,6 +326,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
         dryRun: args.includes("--dry-run"),
         skipWaiter: args.includes("--skip-waiter"),
         launch: get("--zcode-exe") ?? null,
+        // --home 覆盖用户主目录：供向导真机冒烟/隔离验证使用，避免冒烟写入真实 zcode 配置
+        homedir: get("--home") ?? defaultHomedir(),
         log,
       });
     } catch (e) {
