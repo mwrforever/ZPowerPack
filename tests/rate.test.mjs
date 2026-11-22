@@ -1,12 +1,18 @@
 /**
- * 指标层 rate.mjs 的单元测试（核心口径，100% 覆盖）。
- * 钉死设计文档 §五 的口径：TTFT 剔除、时长加权、EMA 平滑、保持逻辑、错误行剔除。
+ * 实时速率 live-rate.mjs 的单元测试（核心状态机，100% 覆盖）。
+ *
+ * 钉死 V2 口径：官方 onDidGenerate 流式事件驱动——streaming 建流、final 收流、
+ * live/recent/idle 三态判定、camelCase 事件键名契约、noteFallbackRow 兜底；
+ * 展示值=官方推送值原样（旧 EMA/窗口加权/三态保持口径全废，用例随之删除）。
+ * requestTps 自 rate.mjs 原样迁移，四条边界用例保持不变。
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { requestTps, windowedRate, ema, displayRate } from "../extension/core/rate.mjs";
+import { requestTps, createLiveRate } from "../extension/core/live-rate.mjs";
+
+// ---- requestTps（自 rate.mjs 迁移，边界语义不变） ----
 
 test("requestTps：output÷生成时长（毫秒换秒），303/2800ms → 108.21", () => {
   const row = { status: "completed", outputTokens: 303, completedAt: 317253, firstTokenAt: 314453 };
@@ -30,104 +36,148 @@ test("requestTps：非 completed / 分母≤0 / 缺产出 → null", () => {
   assert.equal(requestTps({ status: "completed", outputTokens: 0, completedAt: 3000, firstTokenAt: 1000 }), null);
 });
 
-/** 造一行 model_usage 样本 */
-function rowOf({ id, modelId = "glm-4.7", outputTokens, genMs, completedAt, status = "completed", querySource = "main_turn", reasoningTokens = 0 }) {
+// ---- 官方流式事件状态机 createLiveRate ----
+
+/** 构造 onDidGenerate 推送事件（camelCase 契约键名基线；Task 0 探针实测如有出入按 notes 调整映射） */
+function evOf({ sessionId = "s-main", requestId, phase, tps, outputTokens, timeToFirstTokenMs }) {
   return {
-    id,
-    modelId,
-    querySource,
-    status,
-    outputTokens,
-    reasoningTokens,
-    firstTokenAt: completedAt - genMs,
-    completedAt,
-    durationMs: genMs,
+    sessionId,
+    requestId,
+    model: { providerId: "zhipu", modelId: "glm-4.7" },
+    phase,
+    outputTokensPerSecond: tps,
+    ...(outputTokens !== undefined ? { outputTokens } : {}),
+    ...(timeToFirstTokenMs !== undefined ? { timeToFirstTokenMs } : {}),
   };
 }
 
-test("windowedRate：3 行两模型分组，genRate=Σout/Σgen，error 行不计入", () => {
-  // 窗口 now=60000：60s 窗口内 3 行（模型 A×2、模型 B×1）+ 1 行 error（应剔除）
-  const now = 60000;
-  const rows = [
-    rowOf({ id: 1, modelId: "A", outputTokens: 1000, genMs: 5000, completedAt: now - 10000 }), // 200 tps
-    rowOf({ id: 2, modelId: "A", outputTokens: 500, genMs: 2500, completedAt: now - 5000 }), // 200 tps
-    rowOf({ id: 3, modelId: "B", outputTokens: 300, genMs: 1000, completedAt: now - 2000, querySource: "subagent" }), // 300 tps
-    rowOf({ id: 4, modelId: "A", outputTokens: 99999, genMs: 100, completedAt: now - 1000, status: "error" }),
-  ];
-  const r = windowedRate(rows, { now, windowMs: 60000 });
-  // 主口径：Σout/Σgen = 1800/8.5 = 211.76
-  assert.equal(r.genRate, 211.76);
-  // 吞吐：Σout ÷ 窗口秒 = 1800/60 = 30
-  assert.equal(r.throughput, 30);
-  assert.equal(r.sampleDurationMs, 8500);
-  assert.equal(r.byModel.size, 2, "error 行所属模型仍出现但仅按正常行聚合");
-  const a = r.byModel.get("A");
-  assert.equal(a.genRate, 200, "模型 A 两行各 200tps，加权后仍 200");
-  assert.equal(a.throughput, 25);
-  assert.equal(a.lastCompletedAt, now - 5000);
-  assert.equal(a.querySource, "main_turn");
-  assert.equal(r.byModel.get("B").querySource, "subagent");
-  assert.ok(!JSON.stringify([...r.byModel.values()]).includes("99999"), "error 行产出不得计入");
+test("streaming 事件建流：单流 live，totalTps=流速率", () => {
+  const live = createLiveRate();
+  live.onEvent(evOf({ requestId: "r1", phase: "streaming", tps: 428 }), 1000, new Set());
+  const snap = live.snapshot(1500);
+  assert.equal(snap.state, "live");
+  assert.equal(snap.streams.length, 1);
+  assert.deepEqual(snap.streams[0], {
+    requestId: "r1",
+    modelId: "glm-4.7",
+    providerId: "zhipu",
+    isSub: false,
+    tps: 428,
+    phase: "streaming",
+  });
+  assert.equal(snap.totalTps, 428);
+  assert.equal(snap.subTps, 0);
+  assert.equal(snap.lastEventAt, 1000);
+  assert.equal(snap.lastProviderId, "zhipu");
+  assert.equal(snap.lastFinal, null);
+  assert.equal(snap.fallback, null);
 });
 
-test("windowedRate：窗口外的行不参与", () => {
-  const now = 60000;
-  const rows = [
-    rowOf({ id: 1, outputTokens: 6000, genMs: 1000, completedAt: now - 120000 }), // 窗口外
-    rowOf({ id: 2, outputTokens: 100, genMs: 1000, completedAt: now }),
-  ];
-  const r = windowedRate(rows, { now, windowMs: 60000 });
-  assert.equal(r.genRate, 100);
-  assert.equal(r.throughput, 1.67, "吞吐保留 2 位（100÷60s）");
+test("streaming 重复推送刷新速率：同 requestId 只更新流，不重复建流", () => {
+  const live = createLiveRate();
+  const subs = new Set();
+  live.onEvent(evOf({ requestId: "r1", phase: "streaming", tps: 300 }), 1000, subs);
+  // 官方流式期间持续推送瞬时速率，同流以末次推送为准（无平滑）
+  live.onEvent(evOf({ requestId: "r1", phase: "streaming", tps: 428 }), 2000, subs);
+  const snap = live.snapshot(2500);
+  assert.equal(snap.streams.length, 1);
+  assert.equal(snap.streams[0].tps, 428);
+  assert.equal(snap.totalTps, 428);
 });
 
-test("ema(100, 120, 0.3) = 106", () => {
-  assert.equal(ema(100, 120, 0.3), 106);
+test("多流并列：主+子代理双流，streams 两行、isSub 判定正确、subTps 只计子代理", () => {
+  const live = createLiveRate();
+  const subs = new Set(["s-sub"]);
+  live.onEvent(evOf({ sessionId: "s-main", requestId: "r1", phase: "streaming", tps: 300 }), 1000, subs);
+  live.onEvent(evOf({ sessionId: "s-sub", requestId: "r2", phase: "streaming", tps: 96 }), 1500, subs);
+  const snap = live.snapshot(2000);
+  assert.equal(snap.state, "live");
+  assert.equal(snap.streams.length, 2);
+  const main = snap.streams.find((s) => s.requestId === "r1");
+  const sub = snap.streams.find((s) => s.requestId === "r2");
+  assert.equal(main.isSub, false);
+  assert.equal(sub.isSub, true);
+  assert.equal(snap.totalTps, 396);
+  assert.equal(snap.subTps, 96);
 });
 
-test("displayRate：样本不足（Σ生成时长<2s）→ held 且保持上波值", () => {
-  const r = displayRate(
-    { currentValue: 210, prevValue: 190, asOf: 5000, sampleDurationMs: 800, lastNewRowMs: 5900 },
-    { now: 6000 },
-  );
-  assert.equal(r.state, "held");
-  assert.equal(r.value, 190);
-  assert.equal(r.asOf, 5000);
+test("final 事件收流：流消失转 recent，lastFinal 记末值", () => {
+  const live = createLiveRate();
+  const subs = new Set();
+  live.onEvent(evOf({ requestId: "r1", phase: "streaming", tps: 428 }), 1000, subs);
+  live.onEvent(evOf({ requestId: "r1", phase: "final", tps: 415, outputTokens: 8300 }), 9000, subs);
+  const snap = live.snapshot(10000);
+  assert.equal(snap.state, "recent");
+  assert.equal(snap.streams.length, 0);
+  assert.equal(snap.totalTps, 0);
+  assert.deepEqual(snap.lastFinal, { modelId: "glm-4.7", tps: 415, outputTokens: 8300, at: 9000 });
+  assert.equal(snap.lastEventAt, 9000);
+  assert.equal(snap.lastProviderId, "zhipu");
 });
 
-test("displayRate：窗口内无新完成行 → held（不显示 0）", () => {
-  const r = displayRate(
-    { currentValue: 210, prevValue: 190, asOf: 5000, sampleDurationMs: 8000, lastNewRowMs: null },
-    { now: 6000 },
-  );
-  assert.equal(r.state, "held");
-  assert.equal(r.value, 190);
+test("空闲 5 分钟 → idle；recent 态保留末值不显示 0", () => {
+  const live = createLiveRate();
+  const subs = new Set();
+  live.onEvent(evOf({ requestId: "r1", phase: "streaming", tps: 428 }), 1000, subs);
+  live.onEvent(evOf({ requestId: "r1", phase: "final", tps: 415, outputTokens: 8300 }), 9000, subs);
+
+  // final 后 4 分钟：recent 态无流，末值由 lastFinal 带出（视图展示数据时刻速率，不显示 0）
+  let snap = live.snapshot(9000 + 240000);
+  assert.equal(snap.state, "recent");
+  assert.equal(snap.streams.length, 0);
+  assert.equal(snap.totalTps, 0);
+  assert.equal(snap.lastFinal.tps, 415);
+
+  // 恰 5 分钟边界 → 仍 recent；超 1 毫秒 → idle
+  snap = live.snapshot(9000 + 300000);
+  assert.equal(snap.state, "recent");
+  snap = live.snapshot(9000 + 300001);
+  assert.equal(snap.state, "idle");
+  // idle 后末值与最近厂商仍带出（素条空闲态跟随最近请求厂商）
+  assert.equal(snap.lastFinal.tps, 415);
+  assert.equal(snap.lastProviderId, "zhipu");
 });
 
-test("displayRate：超过保持上限（5 分钟无新样本）→ idle", () => {
-  const r = displayRate(
-    { currentValue: 210, prevValue: 190, asOf: 0, sampleDurationMs: 8000, lastNewRowMs: 1000 },
-    { now: 300001, holdMaxMs: 300000 },
-  );
-  assert.equal(r.state, "idle");
+test("事件键名契约：camelCase 载荷直录（Task 0 定案键名不一致时按 notes 调整映射并有单测）", () => {
+  const live = createLiveRate();
+  // 蛇形诱饵键：实现必须只认 camelCase 契约键，误读蛇形键则本用例红
+  const ev = {
+    sessionId: "s-1",
+    requestId: "r-1",
+    model: { providerId: "zhipu", modelId: "glm-4.7" },
+    phase: "streaming",
+    outputTokensPerSecond: 428,
+    timeToFirstTokenMs: 812,
+    session_id: "s-decoy",
+    request_id: "r-decoy",
+    model_id: "decoy-model",
+    provider_id: "decoy-provider",
+    output_tokens_per_second: 999,
+  };
+  live.onEvent(ev, 1000, new Set(["s-1"]));
+  const snap = live.snapshot(1100);
+  assert.equal(snap.streams.length, 1);
+  assert.equal(snap.streams[0].requestId, "r-1");
+  assert.equal(snap.streams[0].modelId, "glm-4.7");
+  assert.equal(snap.streams[0].providerId, "zhipu");
+  assert.equal(snap.streams[0].tps, 428);
+  assert.equal(snap.streams[0].isSub, true, "isSub 取决于 sessionId 是否命中子代理集合");
+  assert.equal(snap.lastProviderId, "zhipu");
 });
 
-test("displayRate：样本充足且有新行 → live 当前值", () => {
-  const r = displayRate(
-    { currentValue: 210, prevValue: 190, asOf: 5000, sampleDurationMs: 8000, lastNewRowMs: 5900 },
-    { now: 6000 },
-  );
-  assert.equal(r.state, "live");
-  assert.equal(r.value, 210);
-});
+test("兜底：noteFallbackRow 后 snapshot.fallback 有值，与流并存时流优先", () => {
+  const live = createLiveRate();
+  // 订阅不可达：服务层喂最新完成行（303 tokens / 2800ms → 108.21）
+  live.noteFallbackRow({ status: "completed", outputTokens: 303, completedAt: 314453, firstTokenAt: 311653 });
+  let snap = live.snapshot(320000);
+  assert.deepEqual(snap.fallback, { tps: 108.21, completedAt: 314453 });
+  // 兜底行不参与状态判定：无事件仍 idle（视图按 fallback 数据时刻渲染）
+  assert.equal(snap.state, "idle");
 
-test("平滑钉死：超短请求与长请求混合，时长加权 genRate 不超过长请求速率 ±10%", () => {
-  const now = 60000;
-  const rows = [
-    rowOf({ id: 1, outputTokens: 50, genMs: 80, completedAt: now - 1000 }), // 超短请求 625tps（会被加权稀释）
-    rowOf({ id: 2, outputTokens: 9000, genMs: 30000, completedAt: now }), // 长请求 300tps
-  ];
-  const r = windowedRate(rows, { now, windowMs: 60000 });
-  // 加权口径：(50+9000)/(0.08+30)s = 300.86 → 与长请求速率差 <1%
-  assert.ok(Math.abs(r.genRate - 300) / 300 <= 0.1, "genRate=" + r.genRate + " 应落在长请求速率 ±10% 内");
+  // 与流并存：状态与速率按流给（流优先由 state=live 表达），fallback 原样带出
+  live.onEvent(evOf({ requestId: "r1", phase: "streaming", tps: 428 }), 320100, new Set());
+  snap = live.snapshot(320200);
+  assert.equal(snap.state, "live");
+  assert.equal(snap.totalTps, 428);
+  assert.deepEqual(snap.fallback, { tps: 108.21, completedAt: 314453 });
 });
