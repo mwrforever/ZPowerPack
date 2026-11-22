@@ -4,3 +4,5 @@ node_modules/
 .superpowers/
 logs/
 *.log
+# 视觉参考原图：他人版权作品（Dribbble），仅本地内部参考，不得提交（仓库根=插件根，提交即随插件分发）
+docs/refs/
