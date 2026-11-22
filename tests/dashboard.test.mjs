@@ -14,7 +14,7 @@ import { readFileSync, existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { activate } from "../extension/main.js";
+import { activate, tick, start } from "../extension/main.js";
 import { toDisplayModel } from "../extension/view-model.mjs";
 
 /** 读取插件 manifest（被测对象：仓库根 .zcode-plugin/plugin.json） */
@@ -421,3 +421,76 @@ async function runActivateOnce(ctx, opts = {}) {
   await new Promise((r) => setTimeout(r, intervalMs * ticks + 30));
   return handle.stop;
 }
+
+// ---------------------------------------------------------------------------
+// 四、tick 调度与节流（性能修复：真机实测打开看板导致整体卡顿的根因闭环）
+// ---------------------------------------------------------------------------
+
+/** 造可计数的假数据源（全部即时返回，带调用计数） */
+function countingDeps(nowFn) {
+  const counts = { new: 0, tools: 0, sessions: 0, quota: 0 };
+  return {
+    counts,
+    fetchNew: async () => { counts.new++; return { rows: [], nextCursor: 0 }; },
+    fetchTools: async () => { counts.tools++; return []; },
+    fetchSessions: async () => { counts.sessions++; return []; },
+    fetchQuota: async () => { counts.quota++; return []; },
+    ...(nowFn ? { now: nowFn } : {}),
+  };
+}
+
+test("tick 防重入：慢周期进行中调度器不叠加并发拉取（HTTP 叠加拖垮宿主的根因）", async () => {
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const deps = {
+    fetchNew: async () => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 60));
+      inFlight--;
+      return { rows: [], nextCursor: 0 };
+    },
+    fetchTools: async () => [],
+    fetchSessions: async () => [],
+    fetchQuota: async () => [],
+  };
+  const handle = start({ intervalMs: 10, deps });
+  await new Promise((r) => setTimeout(r, 220));
+  handle.stop();
+  // 无护栏时 220ms/10ms 间隔会叠出 ~20 轮并发；有护栏任意时刻至多 1 轮在飞
+  assert.equal(maxInFlight, 1, "任意时刻至多一轮拉取在飞");
+});
+
+test("额度 TTL：窗口内多轮不打官方接口，过期后重打（5 分钟节流）", async () => {
+  let clock = 1000000;
+  const deps = countingDeps(() => clock);
+  const state = { cursor: 0, toolCursor: 0, rows: [], toolRows: [], prevValue: 0, emaValue: 0, asOf: 0, lastNewRowMs: null, projectBySession: {} };
+
+  await tick(state, deps); // 首轮即打
+  clock += 60000;
+  await tick(state, deps); // TTL 内 → 缓存
+  clock += 60000;
+  await tick(state, deps); // TTL 内 → 缓存
+  assert.equal(deps.counts.quota, 1, "5 分钟窗口内只打一次额度接口");
+
+  clock += 300000;
+  await tick(state, deps); // 过期 → 重打
+  assert.equal(deps.counts.quota, 2, "过期后重新拉官方额度");
+});
+
+test("会话节流：session 表不逐秒全量重读（30 秒节流）", async () => {
+  let clock = 1000000;
+  const deps = countingDeps(() => clock);
+  const state = { cursor: 0, toolCursor: 0, rows: [], toolRows: [], prevValue: 0, emaValue: 0, asOf: 0, lastNewRowMs: null, projectBySession: {} };
+
+  await tick(state, deps); // 首轮即读
+  clock += 10000;
+  await tick(state, deps); // 节流内 → 缓存
+  clock += 10000;
+  await tick(state, deps); // 节流内 → 缓存
+  clock += 15000;
+  await tick(state, deps); // 累计 35s > 30s → 重读
+  assert.equal(deps.counts.sessions, 2, "30 秒内 session 只全量读两次");
+  // 快照仍逐秒产出（额度/会话走缓存不阻塞速率链路）
+  assert.ok(deps.counts.new >= 4, "模型增量读取不受节流影响");
+});

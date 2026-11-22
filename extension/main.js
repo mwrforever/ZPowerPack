@@ -28,6 +28,10 @@ import RULES from "./core/window-rules.json" with { type: "json" };
 const RATE_WINDOW_MS = 60000;
 /** 环形缓冲保留时长（charts 历史报表的时间底座，24h） */
 const BUFFER_RETAIN_MS = 24 * 3600000;
+/** 额度官方接口节流间隔（5 分钟）：官方 5h 窗口分钟级动态，逐秒打既卡宿主义易触发厂商限流 */
+const QUOTA_TTL_MS = 5 * 60000;
+/** session 表全量重读节流间隔（30 秒）：会话元数据变化低频，按项目映射走缓存 */
+const SESSIONS_TTL_MS = 30 * 1000;
 
 /** 数值保留 2 位 */
 const round2 = (n) => Math.round(n * 100) / 100;
@@ -239,11 +243,24 @@ export async function tick(state, deps) {
     const cutoff = now - BUFFER_RETAIN_MS;
     while (state.rows.length > 0 && (state.rows[0].completedAt ?? 0) < cutoff) state.rows.shift();
 
-    const [newToolRows, quotaRows, sessionRows] = await Promise.all([
-      deps.fetchTools(state.toolCursor ?? 0),
-      deps.fetchQuota(now, state.rows),
-      deps.fetchSessions(),
-    ]);
+    // 工具行增量读取（逐秒，游标扫描代价可忽略）
+    const newToolRows = await deps.fetchTools(state.toolCursor ?? 0);
+
+    // 会话表节流：30 秒内走缓存，避免逐秒全量重读大表
+    if (now - (state.sessionsAt ?? 0) >= SESSIONS_TTL_MS) {
+      const sessionRows = await deps.fetchSessions();
+      state.sessionsAt = now;
+      if (sessionRows.length > 0) state.projectBySession = resolveProjects(sessionRows);
+    }
+
+    // 额度节流：官方接口 5 分钟一打（TTL 缓存），窗口内沿用上次 quotaRows
+    let quotaRows = state.quotaRows ?? [];
+    if (now - (state.quotaAt ?? 0) >= QUOTA_TTL_MS) {
+      quotaRows = await deps.fetchQuota(now, state.rows);
+      state.quotaRows = quotaRows;
+      state.quotaAt = now;
+    }
+
     // 工具行入环形缓冲（与 model 行同口径 24h 底座——报表卡宣称「近 24 小时」，逐 tick 即弃会失真）
     if (newToolRows.length > 0) {
       state.toolRows.push(...newToolRows);
@@ -251,7 +268,6 @@ export async function tick(state, deps) {
       while (state.toolRows.length > 0 && (state.toolRows[0].startedAt ?? 0) < toolCutoff) state.toolRows.shift();
       state.toolCursor = newToolRows[newToolRows.length - 1].startedAt ?? state.toolCursor ?? 0;
     }
-    if (sessionRows.length > 0) state.projectBySession = resolveProjects(sessionRows);
 
     const snapshot = buildSnapshot({
       rows: state.rows,
@@ -316,7 +332,15 @@ export function start(opts = {}) {
   const log = opts.log ?? ((l) => console.log(l));
   const deps = opts.deps ?? realDeps(log);
   const state = { cursor: 0, toolCursor: 0, rows: [], toolRows: [], prevValue: 0, emaValue: 0, asOf: 0, lastNewRowMs: null, projectBySession: {} };
-  const runTick = () => void tick(state, { ...deps, deliver: opts.deliver, snapshotPath: opts.snapshotPath, log });
+  // 防重入护栏：上一轮（HTTP/慢查询）未完成时跳过本拍——避免 setInterval 叠加并发拖垮宿主与网络栈
+  let running = false;
+  const runTick = () => {
+    if (running) return;
+    running = true;
+    void tick(state, { ...deps, deliver: opts.deliver, snapshotPath: opts.snapshotPath, log }).finally(() => {
+      running = false;
+    });
+  };
   const timer = setInterval(runTick, intervalMs);
   // 立即跑第一轮，避免首屏等一个间隔
   runTick();

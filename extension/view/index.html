@@ -384,15 +384,22 @@ function esc(s) {
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-/** 渲染入口：首次数据到达后解除 boot 覆盖 */
+/** 渲染入口：首次数据到达后解除 boot 覆盖；按节差异渲染（数据不变不重建 DOM，降低每秒 DOM 抖动） */
 var booted = false;
+var lastQuotaJson = "";
+var lastGridJson = "";
+var lastDockJson = "";
 function render(dm) {
   if (!dm || !dm.stage) return;
   if (!booted) { booted = true; document.getElementById("boot").classList.add("hide"); }
+  // 舞台是文本级更新（数字/时刻每秒变化，代价可忽略），始终刷新
   renderStage(dm);
-  renderQuota(dm);
-  renderGrid(dm);
-  renderDock(dm);
+  var qj = JSON.stringify(dm.quota);
+  if (qj !== lastQuotaJson) { lastQuotaJson = qj; renderQuota(dm); }
+  var gj = JSON.stringify(dm.grid);
+  if (gj !== lastGridJson) { lastGridJson = gj; renderGrid(dm); }
+  var dj = JSON.stringify(dm.dock);
+  if (dj !== lastDockJson) { lastDockJson = dj; renderDock(dm); }
 }
 
 /** 主循环：1s 轮询注册资源；连续失败进入降级提示（不伪装成空数据） */
