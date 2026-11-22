@@ -138,7 +138,9 @@ test("集成：真实 schema db + provider 夹具 → activate 三周期 → 快
   const snap = JSON.parse(snapText);
   assert.ok(["live", "held"].includes(snap.rate.display.state), `三态应非 idle：${snap.rate.display.state}`);
   assert.equal(snap.rate.lastProviderId, "kimi-code-cn", "最近请求厂商=最后插入行");
-  assert.ok(snap.charts.ttftHist.length === 10, "真实 TTFT 列 → 直方图 10 桶");
+  // Task 1 起 db-reader 行输出收窄为 USED_COLS（TTFT 列已裁）→ V1 直方图降级为空数组；
+  // charts 报表随 V2 整体砍除，Task 4 重写 main.js 后本断言随 V1 形态退役
+  assert.deepEqual(snap.charts.ttftHist, [], "TTFT 列已裁 → 直方图空数组降级不崩");
   assert.equal(snap.charts.toolStats[0].toolName, "Bash", "工具统计按频次排序");
   assert.equal(snap.charts.toolStats[0].calls, 2);
 
