@@ -17,6 +17,7 @@ import {
   USED_COLS,
   fetchNewModelUsage,
   fetchRecentModelUsage,
+  fetchMaxRowid,
   subagentSessionIds,
 } from "../extension/core/db-reader.mjs";
 
@@ -259,4 +260,18 @@ test("库缺失或 completed_at 列缺失：回填返回空结果不抛错（max
   const opened = openDb(dbPath);
   assert.deepEqual(fetchRecentModelUsage(opened.db, opened.schema, 0), { rows: [], maxRowid: 0 });
   opened.db.close();
+});
+
+test("fetchMaxRowid：全表最大 rowid；空表/库缺失 → 0（空窗回填守卫的游标兜底）", () => {
+  const { dbPath } = makeDb({ rows: 30 });
+  const opened = openDb(dbPath);
+  assert.equal(fetchMaxRowid(opened.db), 30);
+  opened.db.close();
+  // 空表 → MAX(rowid)=null → 0
+  const empty = makeDb({ rows: 0 });
+  const openedEmpty = openDb(empty.dbPath);
+  assert.equal(fetchMaxRowid(openedEmpty.db), 0);
+  openedEmpty.db.close();
+  // 库缺失 → 0（游标自 0 起步，同冷启动口径）
+  assert.equal(fetchMaxRowid(null), 0);
 });

@@ -171,13 +171,29 @@ export function fetchNewModelUsage(db, schema, cursor) {
  * @param {number} sinceMs 完成时刻下界（epoch 毫秒，闭区间含等于；来源=服务层 now-24h）
  * @returns {{rows: object[], maxRowid: number}} 行为 USED_COLS 的 camelCase 结构；
  *          空窗口/库缺失/completed_at 列缺失 → 空行且 maxRowid=0
- *          （maxRowid=0 语义=无界可续：调用层增量游标自 0 起步，同 V1 冷启动口径）
+ *          （maxRowid=0 语义=无界可续：调用层走 fetchMaxRowid 初始化游标，
+ *          禁止游标自 0 全量拉——V1 冷启动 8 万行卡顿事故防护）
  */
 export function fetchRecentModelUsage(db, schema, sinceMs) {
   if (!db || !schema.modelUsage.has("completed_at")) return { rows: [], maxRowid: 0 };
   const rows = selectUsedRows(db, schema, 'WHERE "completed_at" >= ?', sinceMs);
   const maxRowid = rows.length > 0 ? rows[rows.length - 1].rowid : 0;
   return { rows, maxRowid };
+}
+
+/**
+ * 全表最大 rowid（空窗回填守卫：有历史但 24h 无新行时，服务层增量游标的初始化兜底）。
+ * @param {DatabaseSync|null} db openDb 返回的连接
+ * @returns {number} 最大 rowid；空表/库缺失/表不存在 → 0（游标自 0 起步，真冷启动口径）
+ */
+export function fetchMaxRowid(db) {
+  if (!db) return 0;
+  try {
+    // MAX(rowid) 空表返回 null → Number(null) 归一为 0；表不存在时 prepare 抛错按 0 容错
+    return Number(db.prepare("SELECT MAX(rowid) AS maxRowid FROM model_usage").get()?.maxRowid) || 0;
+  } catch {
+    return 0;
+  }
 }
 
 /**

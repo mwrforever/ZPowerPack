@@ -1,110 +1,96 @@
 /**
- * ZPowerPack 扩展服务层：1s 轮询聚合管线 + 视图消费的唯一快照契约（buildSnapshot）。
+ * ZPowerPack 扩展服务层（V2）：60s 拍增量聚合 + 官方流式事件驱动实时速率 + 视图消费的唯一快照契约。
  *
- * 架构（Task 8 定案，V1 二次探测实证）：宿主对 entry 形态视图构建 MCP server，伺服 pageUri 之外
- * 还伺服注册资源（tools/resources 定义，宿主源码 wM 直证）——视图经 window.zcode.readResource
- * 轮询注册资源取数（1s，与 tick 同节奏）；快照文件（<cliStorageRoot>/zpowerpack/last-snapshot.json
- * 原子写）保留为兜底。运行环境 = 扩展宿主 Node 进程。
- *
- * 快照字段即渲染契约：rate（三态+主/子代理分列+按模型+最近厂商）、quota（实例×窗口）、
- * charts（吞吐/首字等待直方图/上下文→速率/时段热力/按项目/工具统计/厂商稳定性）。
- * 快照序列化结果不得含任何密钥（apiKey 只在 quota-fetch 请求头内出现，永不进入数据流）。
+ * 架构（V2 重设计定案，docs/superpowers/specs/2026-11-22-zpowerpack-dashboard-v2-design.md）：
+ * - 实时速率：官方 models.onDidGenerate 流式事件直录（live-rate 状态机），无 EMA/无窗口加权/
+ *   无三态保持——展示值=官方推送值原样；订阅绑定由 Task 6 接线，本模块产出事件入口；
+ * - 聚合层：db 只做 60s rowid 增量拉取落小时桶（hourly.mjs），激活首拍有界回填近 24h
+ *   （禁 V1 游标 0 全量拉 8 万行的卡顿事故重演）；24h 趋势与 5h 额度兜底分子同源小时桶，
+ *   任何时刻不重扫全量缓冲；charts 八报表全量计算退役；
+ * - 额度层：官方接口 60s 一拉（TTL 缓存 + quotaPending 手动同步待办，Task 6 的 sync 资源置位）；
+ *   本地分子兜底收窄至 5h 窗口（§五.3 裁量），周/月官方失败只出状态句；
+ * - 快照契约 buildSnapshotV2：{generatedAt, rate, quota, trend, conclusion}，序列化安全无密钥
+ *   （apiKey 只在额度请求头内出现，永不进入数据流）；
+ * - 快照文件（<cliStorageRoot>/zpowerpack/last-snapshot.json 原子写）保留为兜底通道。
+ * 运行环境 = 扩展宿主 Node 进程，单线程事件循环（状态无并发风险，防重入护栏防定时器叠加）。
  */
 
 import { writeFileSync, renameSync, mkdirSync, readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import os from "node:os";
 
-import { windowedRate, displayRate, ema } from "./core/rate.mjs";
-import { windowBounds, usageInWindow, percent } from "./core/quota.mjs";
+import { windowBounds, percent } from "./core/quota.mjs";
 import { fetchLimit } from "./core/quota-fetch.mjs";
 import { matchTemplateFamily } from "./core/providers.mjs";
-import { resolveDbPath, openDb, fetchNewModelUsage, fetchToolUsage, fetchSessions } from "./core/db-reader.mjs";
+import { resolveDbPath, openDb, fetchNewModelUsage, fetchRecentModelUsage, fetchMaxRowid, fetchSessions, subagentSessionIds } from "./core/db-reader.mjs";
+import { newBuckets, addRow, prune, trendPoints, windowSum } from "./core/hourly.mjs";
+import { createLiveRate } from "./core/live-rate.mjs";
+import { toDisplayModelV2 } from "./view-model.mjs";
 import { resolveCliStorageRoot, resolveProviderConfigPath } from "../scripts/migrate/config.mjs";
-import { toDisplayModel, ttftHistogram } from "./view-model.mjs";
 import RULES from "./core/window-rules.json" with { type: "json" };
 
-/** 速率窗口默认值（§五：窗口时长可配置） */
-const RATE_WINDOW_MS = 60000;
-/** 环形缓冲保留时长（charts 历史报表的时间底座，24h） */
-const BUFFER_RETAIN_MS = 24 * 3600000;
-/** 额度官方接口节流间隔（5 分钟）：官方 5h 窗口分钟级动态，逐秒打既卡宿主义易触发厂商限流 */
-const QUOTA_TTL_MS = 5 * 60000;
-/** session 表全量重读节流间隔（30 秒）：会话元数据变化低频，按项目映射走缓存 */
-const SESSIONS_TTL_MS = 30 * 1000;
+/** 60s 拍间隔（设计 §五.3：速率靠事件、趋势小时粒度、额度 60s 自动——看板开关不影响拍频） */
+const TICK_MS = 60000;
+/** 额度官方接口节流间隔（60 秒）：官方窗口分钟级动态，逐拍重打易触发厂商限流 */
+const QUOTA_TTL_MS = 60000;
+/** session 表全量重读节流间隔（60 秒）：会话元数据变化低频，主/子代理归属判定走缓存 */
+const SESSIONS_TTL_MS = 60000;
+/** 事件型 deliver 节流间隔（毫秒）：流式期官方每秒多推，一秒内仅重建一次快照（事件风暴护栏） */
+const EVENT_THROTTLE_MS = 1000;
+/** 首拍有界回填窗口（近 24h）：一次性查询落桶即弃，游标从回填行最大 rowid 起步 */
+const BACKFILL_MS = 24 * 3600000;
+/** 滞留流收口阈值：流事件静默超 10 分钟即视为宿主丢失 final（控制者裁决，T3 审查 Minor #4） */
+const STALE_STREAM_MS = 10 * 60000;
+/** 结论采样序列长度上限：60s 一拉 × 30 ≈ 近 30 分钟官方 percent（结论外推的时间底座） */
+const PERCENT_HISTORY_MAX = 30;
+/** 结论外推最少采样数：<5 个不给推算（样本不足由 view-model 出诚实占位句） */
+const CONCLUSION_MIN_SAMPLES = 5;
 
-/** 数值保留 2 位 */
-const round2 = (n) => Math.round(n * 100) / 100;
-
-/** 分位数（线性插值；sorted 升序数组） */
-function quantile(sorted, q) {
-  if (sorted.length === 0) return null;
-  if (sorted.length === 1) return round2(sorted[0]);
-  const pos = (sorted.length - 1) * q;
-  const lo = Math.floor(pos);
-  const hi = Math.ceil(pos);
-  return round2(sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo));
-}
-
-/** 单请求生成时长（毫秒）：first_token_at 优先，缺失兜底 duration_ms */
-function genMsOf(row) {
-  if (typeof row.firstTokenAt === "number" && typeof row.completedAt === "number") return row.completedAt - row.firstTokenAt;
-  if (typeof row.durationMs === "number") return row.durationMs;
-  return 0;
-}
-
-/** 产出 token 数：output + reasoning（reasoning 计入产出） */
-function outputOf(row) {
-  return (row.outputTokens ?? 0) + (row.reasoningTokens ?? 0);
+/**
+ * 新建服务状态（tickV2/事件入口的唯一可变载体，快照全部数据源）。
+ * @returns {{cursor: number|null, buckets: Map, live: object, subagentIds: Set<string>,
+ *           sessionsAt: number, quotaRows: object[], quotaAt: number,
+ *           percentHistory: Map<string, Array<{t: number, pct: number}>>, quotaPending: boolean}}
+ *          cursor=null 标记首拍未回填（首拍走有界回填后恒为数值）；
+ *          percentHistory=providerId→官方 percent 采样序列（≤30 个）；
+ *          quotaPending=手动同步待办（Task 6 的 sync 资源 read 回调置位，本拍绕过 TTL 即拉）
+ */
+export function createState() {
+  return {
+    cursor: null,
+    buckets: newBuckets(),
+    live: createLiveRate(),
+    subagentIds: new Set(),
+    sessionsAt: 0,
+    quotaRows: [],
+    quotaAt: 0,
+    percentHistory: new Map(),
+    quotaPending: false,
+  };
 }
 
 /**
- * 构建视图快照（纯函数，唯一输出契约）。
- * @param {{rows: object[], toolRows?: object[], quotaRows?: object[], now: number,
- *          rateState: {prevValue?: number, emaValue?: number, asOf?: number, lastNewRowMs?: number|null},
- *          projectBySession?: Record<string, string>}} input
- *          rows=环形缓冲内的 model_usage 行；quotaRows=额度引擎产出（已剥离密钥）；
- *          projectBySession=sessionId→项目目录（已按 parent 链归到根会话）
- * @returns {{generatedAt: number, rate: object, quota: object[], charts: object}} 序列化安全（无密钥）
+ * 构建视图快照 V2（纯函数，唯一输出契约；输入形状与 view-model toDisplayModelV2 的消费契约一致）。
+ * @param {{liveSnapshot: object, quotaRows?: object[], trend?: object[], conclusion?: object|null,
+ *          now: number}} input
+ *          liveSnapshot=live-rate snapshot 原样（state/streams/totalTps/subTps/lastEventAt/
+ *          lastProviderId/lastFinal/fallback）；quotaRows=额度引擎产出（已剥离密钥）；
+ *          trend=hourly trendPoints 24 点；conclusion=computeConclusion 产物或 null
+ * @returns {{generatedAt: number, rate: object, quota: object[], trend: object[], conclusion: object|null}}
+ *          序列化安全（无密钥）；无 charts 键（八报表随 V2 退役）
  */
-export function buildSnapshot(input) {
-  const { rows, toolRows = [], quotaRows = [], now, rateState = {}, projectBySession = {} } = input;
-
-  // ---- 速率区：主口径 + main/subagent 分列 + 按模型明细 ----
-  const windowed = windowedRate(rows, { now, windowMs: RATE_WINDOW_MS });
-  const mainRate = windowedRate(rows.filter((r) => r.querySource !== "subagent"), { now, windowMs: RATE_WINDOW_MS });
-  const subRate = windowedRate(rows.filter((r) => r.querySource === "subagent"), { now, windowMs: RATE_WINDOW_MS });
-
-  // EMA 平滑链：上一展示值 → 当前窗口值，再进三态判定
-  const currentValue = windowed.genRate !== null ? ema(rateState.emaValue ?? rateState.prevValue ?? 0, windowed.genRate) : null;
-  const display = displayRate(
-    {
-      currentValue,
-      prevValue: rateState.prevValue ?? 0,
-      asOf: rateState.asOf ?? 0,
-      sampleDurationMs: windowed.sampleDurationMs,
-      lastNewRowMs: rateState.lastNewRowMs,
-    },
-    { now },
-  );
-
-  // byModel：数组化并按最近完成行降序（视图明细行顺序契约）
-  const byModel = [...windowed.byModel.entries()]
-    .map(([modelId, v]) => ({ modelId, ...v }))
-    .sort((a, b) => b.lastCompletedAt - a.lastCompletedAt);
-
-  const rate = {
-    main: { genRate: mainRate.genRate, throughput: mainRate.throughput },
-    subagent: { genRate: subRate.genRate, throughput: subRate.throughput },
-    windowed: { genRate: windowed.genRate, throughput: windowed.throughput, sampleDurationMs: windowed.sampleDurationMs },
-    byModel,
-    display,
-    // 最近一次完成请求的厂商（迷你条「跟随最近请求的 provider」数据源）
-    lastProviderId: rateState.lastProviderId ?? null,
-  };
-
-  // ---- 额度区：透传额度引擎产出（shape 固定为视图契约）----
-  const quota = quotaRows.map((q) => ({
+export function buildSnapshotV2(input) {
+  const { liveSnapshot, quotaRows = [], trend = [], conclusion = null, now } = input;
+  // rate=live-rate snapshot 原样带出；唯一数据侧裁量：final 末值更新时压制过期兜底行
+  // （T5 审查集成确认——idle+fallback 且 lastFinal 更新时视图不得再显示兜底旧值；
+  // view-model 按「谁新取谁」取末值，数据侧保证 lastFinal 恒优先即可，兜底行仅在
+  // 比最后 final 更新时才供视图取值=订阅挂掉后的接管形态）
+  const rate = { ...liveSnapshot };
+  if (rate.fallback && rate.lastFinal && rate.lastFinal.at >= rate.fallback.completedAt) {
+    rate.fallback = null;
+  }
+  // quota 形状沿用 V1 透传：实例/窗口契约键固定，额度引擎内部字段剥离、nextResetMs 归一 null
+  const quota = (quotaRows ?? []).map((q) => ({
     providerId: q.providerId,
     name: q.name,
     windows: (q.windows ?? []).map((w) => ({
@@ -119,197 +105,235 @@ export function buildSnapshot(input) {
     percent: q.percent ?? null,
     source: q.source,
   }));
+  return { generatedAt: now, rate, quota, trend, conclusion };
+}
 
-  // ---- charts 七组（24h 环形缓冲为底座；界面文案映射在视图层做，快照保留标准名）----
-  const completed = rows.filter((r) => r.status === "completed" && genMsOf(r) > 0 && outputOf(r) > 0);
-
-  // 吞吐对比：按模型 tps 分位数 + 平均延迟
-  const byModelAgg = new Map();
-  for (const r of completed) {
-    const key = r.modelId ?? "(未知模型)";
-    const agg = byModelAgg.get(key) ?? { tpsList: [], latencyList: [] };
-    agg.tpsList.push((outputOf(r) / genMsOf(r)) * 1000);
-    if (typeof r.timeToFirstTokenMs === "number") agg.latencyList.push(r.timeToFirstTokenMs);
-    byModelAgg.set(key, agg);
+/**
+ * 结论句外推（纯函数）：对 5h 水位最高的实例，用官方 percent 采样首尾斜率线性外推至重置时刻。
+ * 「撑得到/撑不到」的措辞由 view-model 完成；本函数只产出数值与诚实边界。
+ * @param {object[]} quotaRows 额度引擎产出（percent=rolling-5h 口径的当前水位）
+ * @param {Map<string, Array<{t: number, pct: number}>>} percentHistory
+ *        providerId→采样序列（时间递增、≤30 个；官方失败样本不入列）
+ * @param {number} now 当前时刻（epoch 毫秒；重置时刻已过则外推无意义）
+ * @returns {{instanceName: string, pctNow: number, pctAtReset: number, resetMs: number}|null}
+ *          样本 <5、增量≈0、无时间跨度、无官方重置时刻或重置已过 → null
+ *          （「消耗速度尚不足以推算」占位由 view-model 处理，不在这里编造）
+ */
+export function computeConclusion(quotaRows, percentHistory, now) {
+  // 取 5h 水位最高的实例作为外推对象（快照契约 percent=rolling-5h 口径）
+  let top = null;
+  for (const q of quotaRows ?? []) {
+    if (typeof q?.percent !== "number") continue;
+    if (top === null || q.percent > top.percent) top = q;
   }
-  const throughput = [...byModelAgg.entries()].map(([modelId, a]) => {
-    const sorted = [...a.tpsList].sort((x, y) => x - y);
-    return {
-      modelId,
-      tpsP50: quantile(sorted, 0.5),
-      tpsP95: quantile(sorted, 0.95),
-      avgLatencyMs: a.latencyList.length ? round2(a.latencyList.reduce((s, x) => s + x, 0) / a.latencyList.length) : null,
-      samples: sorted.length,
-    };
-  });
-
-  // 首字等待：按模型 TTFT 分位数（缺失该列时降级为空数组）
-  const latency = [...byModelAgg.entries()]
-    .filter(([, a]) => a.latencyList.length > 0)
-    .map(([modelId, a]) => {
-      const sorted = [...a.latencyList].sort((x, y) => x - y);
-      return { modelId, ttftP50: quantile(sorted, 0.5), ttftP95: quantile(sorted, 0.95), samples: sorted.length };
-    });
-
-  // 上下文→速率散点（input_tokens vs tps）
-  const ctxVsRate = completed.map((r) => ({
-    inputTokens: r.inputTokens ?? 0,
-    tps: round2((outputOf(r) / genMsOf(r)) * 1000),
-    modelId: r.modelId ?? "(未知模型)",
-  }));
-
-  // 按项目：sessionId → 根会话项目目录聚合
-  const byProjectMap = new Map();
-  for (const r of rows) {
-    const project = projectBySession[r.sessionId] ?? "(未知项目)";
-    const agg = byProjectMap.get(project) ?? { project, tokens: 0, requests: 0 };
-    agg.tokens += (r.inputTokens ?? 0) + outputOf(r);
-    agg.requests++;
-    byProjectMap.set(project, agg);
-  }
-  const byProject = [...byProjectMap.values()].sort((a, b) => b.tokens - a.tokens);
-
-  // 工具统计：频次/耗时/错误
-  const toolMap = new Map();
-  for (const t of toolRows) {
-    const name = t.toolName ?? "(未知工具)";
-    const agg = toolMap.get(name) ?? { toolName: name, calls: 0, errors: 0, totalDurationMs: 0 };
-    agg.calls++;
-    if (t.status && t.status !== "ok" && t.status !== "success") agg.errors++;
-    agg.totalDurationMs += t.durationMs ?? 0;
-    toolMap.set(name, agg);
-  }
-  const toolStats = [...toolMap.values()]
-    .map((t) => ({ ...t, avgDurationMs: t.calls ? round2(t.totalDurationMs / t.calls) : 0 }))
-    .sort((a, b) => b.calls - a.calls);
-
-  // 厂商稳定性：error 率 + 重试率（按 providerId）
-  const healthMap = new Map();
-  for (const r of rows) {
-    const agg = healthMap.get(r.providerId) ?? { providerId: r.providerId, requests: 0, errors: 0, retries: 0 };
-    agg.requests++;
-    if (r.status === "error") agg.errors++;
-    if ((r.retryCount ?? 0) > 0) agg.retries++;
-    healthMap.set(r.providerId, agg);
-  }
-  const providerHealth = [...healthMap.values()].map((h) => ({
-    providerId: h.providerId,
-    requests: h.requests,
-    errorRate: h.requests ? round2(h.errors / h.requests) : 0,
-    retryRate: h.requests ? round2(h.retries / h.requests) : 0,
-  }));
-
-  // 时段热力图：7×24（本地时区，星期×小时，token 总量）
-  const heatmap = Array.from({ length: 7 }, () => Array.from({ length: 24 }, () => 0));
-  for (const r of rows) {
-    const t = typeof r.startedAt === "number" ? r.startedAt : r.completedAt;
-    if (typeof t !== "number") continue;
-    const d = new Date(t);
-    heatmap[d.getDay()][d.getHours()] += (r.inputTokens ?? 0) + outputOf(r);
-  }
-
-  // 首字等待分布直方图：真实 TTFT 分桶（锁定稿直方图视觉的诚实数据源；缺该列时空数组）
-  const ttftHist = ttftHistogram(rows);
-
+  if (top === null) return null;
+  const samples = percentHistory?.get(top.providerId) ?? [];
+  if (samples.length < CONCLUSION_MIN_SAMPLES) return null;
+  const first = samples[0];
+  const last = samples[samples.length - 1];
+  // 采样无时间跨度（同刻多样本）→ 斜率不可求，不编造
+  if (!(last.t > first.t)) return null;
+  // 增量 ≈0 → 水位静止无法推算（官方 percent 精度 0.1，慢消耗 30 分钟零增量是真实形态）
+  const delta = last.pct - first.pct;
+  if (!(Math.abs(delta) > 0)) return null;
+  // 重置时刻以官方为唯一权威：无官方 nextResetMs 或已过重置 → 无处外推
+  const head = (top.windows ?? []).find((w) => w?.type === "rolling-5h") ?? (top.windows ?? [])[0] ?? null;
+  const resetMs = head?.nextResetMs;
+  if (typeof resetMs !== "number" || !Number.isFinite(resetMs) || resetMs <= now) return null;
+  // 线性外推：首尾斜率推至重置时刻（界面标注「推算」，非精确预言）
+  const slope = delta / (last.t - first.t); // 百分点/毫秒
+  const pctAtReset = last.pct + slope * (resetMs - last.t);
   return {
-    generatedAt: now,
-    rate,
-    quota,
-    charts: { throughput, latency, ttftHist, ctxVsRate, byProject, toolStats, providerHealth, heatmap },
+    instanceName: top.name ?? top.providerId,
+    pctNow: last.pct,
+    // 与官方 percent 同精度（0.1 百分点），避免视图出现长尾小数
+    pctAtReset: Math.round(pctAtReset * 10) / 10,
+    resetMs,
   };
 }
 
 /**
- * 单个轮询周期：拉增量 → 入环形缓冲 → 裁剪 → 构建快照 → 送达视图（推送/文件兜底）。
- * 供 activate() 的定时器调用；测试直接驱动本函数。
- * @param {object} state 可变服务状态 {cursor, toolCursor, rows, toolRows, prevValue, emaValue, asOf, lastNewRowMs, lastProviderId, projectBySession}
- * @param {{fetchNew: Function, fetchTools: Function, fetchQuota: Function, fetchSessions: Function,
- *          deliver?: Function, snapshotPath?: string, now?: Function, log?: Function}} deps 全部可注入
+ * 单个轮询周期（60s 拍）：数据拉取（首拍回填/增量）→落桶→滞留收口→会话刷新→
+ * 额度拉取→percentHistory 追加→快照→送达（推送/文件兜底）。
+ * 供 activate 的定时器调用；测试直接驱动本函数（节奏常量由 start 的 intervalMs 注入覆盖）。
+ * @param {object} state createState 产物（可变服务状态）
+ * @param {{fetchRecent: Function, fetchMaxRowid: Function, fetchNew: Function,
+ *          fetchSessions: Function, fetchQuota: Function, deliver?: Function,
+ *          snapshotPath?: string, now?: Function, log?: Function}} deps 全部可注入
  */
-export async function tick(state, deps) {
+export async function tickV2(state, deps) {
   const now = (deps.now ?? Date.now)();
   const log = deps.log ?? (() => {});
   try {
-    // 增量拉取（rowid 游标）
-    const { rows: newRows, nextCursor } = await deps.fetchNew(state.cursor);
-    if (newRows.length > 0) {
-      state.rows.push(...newRows);
-      state.cursor = nextCursor;
-      state.lastNewRowMs = newRows[newRows.length - 1].completedAt ?? now;
-      // 跟随最近请求的厂商（迷你条数据源）
-      state.lastProviderId = newRows[newRows.length - 1].providerId ?? state.lastProviderId;
+    // ---- ① 数据拉取：首拍有界回填，其后 rowid 增量 ----
+    if (state.cursor == null) {
+      // 首拍回填：近 24h 一次性有界查询，行落桶即弃（游标与桶不做跨重启持久化，
+      // 重启代价=一次有界回填；V1 游标 0 全量拉 8 万行是卡顿根因，禁止重演）
+      const { rows, maxRowid } = await deps.fetchRecent(now - BACKFILL_MS);
+      for (const row of rows) addRow(state.buckets, row);
+      // 空窗回填守卫（T1 审查真风险）：有历史但 24h 无新行时回填零行、maxRowid=0，
+      // 若游标照抄 0，首拍增量会从 0 全量拉 8 万历史行——改用全表 MAX(rowid) 初始化
+      state.cursor = maxRowid > 0 ? maxRowid : await deps.fetchMaxRowid();
+      noteNewestFallback(state, rows);
+      log(`[看板] 首拍回填完成：${rows.length} 行落桶，增量游标=${state.cursor}`);
+    } else {
+      const { rows: newRows, nextCursor } = await deps.fetchNew(state.cursor);
+      if (newRows.length > 0) {
+        // 增量行 O(1) 落小时桶（24h 趋势与 5h 兜底分子同源），不持有行数组
+        for (const row of newRows) addRow(state.buckets, row);
+        state.cursor = nextCursor;
+        noteNewestFallback(state, newRows);
+      }
     }
-    // 环形缓冲裁剪：仅保留 BUFFER_RETAIN_MS 内的行（24h 报表底座）
-    const cutoff = now - BUFFER_RETAIN_MS;
-    while (state.rows.length > 0 && (state.rows[0].completedAt ?? 0) < cutoff) state.rows.shift();
+    // 桶裁剪：每实例仅保留 25 小时桶（当前+前 24h），防长期运行内存增长
+    prune(state.buckets, now);
 
-    // 工具行增量读取（逐秒，游标扫描代价可忽略）
-    const newToolRows = await deps.fetchTools(state.toolCursor ?? 0);
+    // 滞留流守卫：宿主丢失 final 事件的流按 final 收口（详见函数注释）
+    closeStaleStreams(state, now, log);
 
-    // 会话表节流：30 秒内走缓存，避免逐秒全量重读大表
+    // ---- ② 会话刷新（60s 节流）：主/子代理归属判定的唯一数据源 ----
     if (now - (state.sessionsAt ?? 0) >= SESSIONS_TTL_MS) {
       const sessionRows = await deps.fetchSessions();
       state.sessionsAt = now;
-      if (sessionRows.length > 0) state.projectBySession = resolveProjects(sessionRows);
+      state.subagentIds = subagentSessionIds(sessionRows);
     }
 
-    // 额度节流：官方接口 5 分钟一打（TTL 缓存），窗口内沿用上次 quotaRows
+    // ---- ③ 额度拉取（60s 节流；手动同步待办绕过 TTL 即拉） ----
     let quotaRows = state.quotaRows ?? [];
-    if (now - (state.quotaAt ?? 0) >= QUOTA_TTL_MS) {
-      quotaRows = await deps.fetchQuota(now, state.rows);
+    if (state.quotaPending || now - (state.quotaAt ?? 0) >= QUOTA_TTL_MS) {
+      quotaRows = await deps.fetchQuota(now, state.buckets);
       state.quotaRows = quotaRows;
       state.quotaAt = now;
+      // 拉取成功才清待办；失败保留，下一拍重试（sync 的即时性承诺不因单次失败丢失）
+      state.quotaPending = false;
+      // 官方 percent 采样入列（结论外推底座）；缓存期不重复入列防零增量稀释斜率
+      appendPercentHistory(state.percentHistory, quotaRows, now);
     }
 
-    // 工具行入环形缓冲（与 model 行同口径 24h 底座——报表卡宣称「近 24 小时」，逐 tick 即弃会失真）
-    if (newToolRows.length > 0) {
-      state.toolRows.push(...newToolRows);
-      const toolCutoff = now - BUFFER_RETAIN_MS;
-      while (state.toolRows.length > 0 && (state.toolRows[0].startedAt ?? 0) < toolCutoff) state.toolRows.shift();
-      state.toolCursor = newToolRows[newToolRows.length - 1].startedAt ?? state.toolCursor ?? 0;
-    }
-
-    const snapshot = buildSnapshot({
-      rows: state.rows,
-      toolRows: state.toolRows,
-      quotaRows,
-      now,
-      rateState: state,
-      projectBySession: state.projectBySession ?? {},
-    });
-
-    // 平滑链推进：display.value 已按三态取值（held/idle 保持 prevValue），作为下轮基准
-    state.prevValue = snapshot.rate.display.value;
-    state.emaValue = snapshot.rate.windowed.genRate !== null ? snapshot.rate.windowed.genRate : state.emaValue;
-    state.asOf = state.lastNewRowMs ?? state.asOf;
-
-    // 送达：宿主推送（server factory 资源更新）与文件兜底（原子写）双通道
-    if (deps.deliver) deps.deliver(snapshot);
-    if (deps.snapshotPath) writeSnapshotFile(deps.snapshotPath, snapshot);
-    log(`[看板] 快照已构建：rate=${snapshot.rate.display.state}，quota=${snapshot.quota.length} 实例，缓冲 ${state.rows.length} 行`);
+    // ---- ④ 快照组装 + 送达（宿主推送/文件兜底双通道） ----
+    const snapshot = assembleAndDeliver(state, quotaRows, now, deps);
+    log(`[看板] 快照已构建：rate=${snapshot.rate.state}，quota=${snapshot.quota.length} 实例，游标=${state.cursor}`);
   } catch (e) {
-    // 轮询失败不致命：下一周期重试；日志不含数据细节
+    // 轮询失败不致命：状态保持上一拍口径，下一周期重试；日志不含数据细节
     log(`[看板] 轮询周期失败（${e?.name || "异常"}）：${e?.message ?? ""}`);
   }
 }
 
-/** sessionId→项目目录：parent 链上溯到根会话，取根会话 directory；无 directory 用标题 */
-function resolveProjects(sessionRows) {
-  const byId = new Map(sessionRows.map((s) => [s.id, s]));
-  const out = {};
-  for (const s of sessionRows) {
-    let cur = s;
-    const seen = new Set();
-    while (cur?.parentId && byId.has(cur.parentId) && !seen.has(cur.id)) {
-      seen.add(cur.id);
-      cur = byId.get(cur.parentId);
+/**
+ * 官方生成事件入口工厂（activate 在 Task 6 绑定到宿主 models.onDidGenerate 订阅）。
+ * live.onEvent 恒执行（流状态机直录官方推送值，节流不吞事件）；快照重建与 deliver
+ * 按 EVENT_THROTTLE_MS 节流：一秒内多事件仅一次重建（事件风暴护栏，60s 拍兜底收尾）。
+ * @param {object} state createState 产物（读取 quotaRows/buckets/percentHistory 组装快照）
+ * @param {{deliver?: Function, snapshotPath?: string, log?: Function}} deps 送达通道
+ * @returns {(ev: object, now?: number) => void} 事件处理函数（now 缺省取宿主到达时刻）
+ */
+export function createOnGenerateEvent(state, deps = {}) {
+  // 节流时钟：仅统计「事件型」deliver（60s 拍的 deliver 不占事件窗口，速率变化即时上屏）
+  let lastDeliverAt = 0;
+  return (ev, now = Date.now()) => {
+    const log = deps.log ?? (() => {});
+    try {
+      // 事件恒直录流状态机（官方推送值原样，无平滑）——subagentIds 由 60s 拍刷新
+      state.live.onEvent(ev, now, state.subagentIds);
+      // 距上次事件型 deliver < 1s → 只更新 live，不重建快照
+      if (now - lastDeliverAt < EVENT_THROTTLE_MS) return;
+      lastDeliverAt = now;
+      assembleAndDeliver(state, state.quotaRows ?? [], now, deps);
+    } catch (e) {
+      // 事件回调异常不外抛宿主：订阅通道不因单次组装失败而中断
+      log(`[看板] 事件处理失败（${e?.name || "异常"}）：${e?.message ?? ""}`);
     }
-    out[s.id] = cur?.directory ?? cur?.title ?? "(未知项目)";
-  }
-  return out;
+  };
 }
 
-/** 快照文件原子写（视图拉取式兜底） */
+/**
+ * 组装快照并送达（tickV2 与事件入口共用的唯一出口：构建→deliver→文件兜底）。
+ * @param {object} state 服务状态
+ * @param {object[]} quotaRows 本拍额度产出（增量拍用缓存行，事件拍用 state 缓存）
+ * @param {number} now 本拍时刻（epoch 毫秒）
+ * @param {{deliver?: Function, snapshotPath?: string}} deps 送达通道
+ * @returns {object} 快照（{generatedAt, rate, quota, trend, conclusion}）
+ */
+function assembleAndDeliver(state, quotaRows, now, deps) {
+  const snapshot = buildSnapshotV2({
+    liveSnapshot: state.live.snapshot(now),
+    quotaRows,
+    trend: trendPoints(state.buckets, now),
+    conclusion: computeConclusion(quotaRows, state.percentHistory, now),
+    now,
+  });
+  if (deps.deliver) deps.deliver(snapshot);
+  if (deps.snapshotPath) writeSnapshotFile(deps.snapshotPath, snapshot);
+  return snapshot;
+}
+
+/**
+ * 兜底链（§五.5）：把本拍最新完成行喂给 live-rate 兜底入口。
+ * 订阅链正常时官方 final 末值（lastFinal）恒更新，buildSnapshotV2 会按「lastFinal 恒优先」
+ * 压制过期兜底行，故无条件喂入安全；订阅挂掉后兜底行（比 lastFinal 新）自动接管速率条。
+ * @param {object} state 服务状态
+ * @param {object[]} rows 本拍新增/回填行（rowid 升序，末位最新；可为空数组）
+ */
+function noteNewestFallback(state, rows) {
+  // 倒序找最新「完成」行：error 行产出为 0，速率算不出真实值，不入兜底链
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (rows[i]?.status === "completed") {
+      state.live.noteFallbackRow(rows[i]);
+      return;
+    }
+  }
+}
+
+/**
+ * 滞留流守卫（每拍）：流事件静默超 10 分钟的流按 final 收口——记 lastFinal 末值、删流。
+ * 依据（T3 审查 Minor #4 控制者裁决）：宿主若丢失 final 事件，流会永久滞留致 state 恒 live
+ * （「看起来在动但数据没动」的反目标形态）。live-rate 流对象不带各自时间戳（公开契约无此键），
+ * 以状态机级 lastEventAt（任意事件都会刷新）作全部滞留流的静默时钟：任一流活跃都会顶新时钟，
+ * 故「时钟停超 10 分钟」必意味着全部现存流都已滞留。收口走 onEvent 公开契约（不侵入
+ * live-rate 内部）：合成 final 使状态机自然记末值、删流并转入 recent 态。
+ * @param {object} state 服务状态
+ * @param {number} now 本拍时刻（epoch 毫秒）
+ * @param {Function} log 日志
+ */
+function closeStaleStreams(state, now, log) {
+  const snap = state.live.snapshot(now);
+  if (snap.streams.length === 0) return;
+  if (snap.lastEventAt === null || now - snap.lastEventAt <= STALE_STREAM_MS) return;
+  for (const s of snap.streams) {
+    // 合成 final 事件：速率取流上末次官方推送值；产出数缺失按契约置 null（保形稳定）
+    state.live.onEvent(
+      {
+        requestId: s.requestId,
+        model: { providerId: s.providerId, modelId: s.modelId },
+        phase: "final",
+        outputTokensPerSecond: s.tps,
+      },
+      now,
+      state.subagentIds,
+    );
+  }
+  log(`[看板] ${snap.streams.length} 路流静默超 10 分钟，按 final 收口（宿主 final 丢失守卫）`);
+}
+
+/**
+ * 官方 percent 采样入列（结论外推底座；仅在额度实际拉取后调用）。
+ * @param {Map<string, Array<{t: number, pct: number}>>} percentHistory 采样序列集（原地更新）
+ * @param {object[]} quotaRows 本拍额度产出
+ * @param {number} now 采样时刻（epoch 毫秒）
+ */
+function appendPercentHistory(percentHistory, quotaRows, now) {
+  for (const q of quotaRows ?? []) {
+    // 官方失败（percent=null）不入列：null 会污染外推斜率，也不该假装有水位
+    if (typeof q?.percent !== "number") continue;
+    const list = percentHistory.get(q.providerId) ?? [];
+    list.push({ t: now, pct: q.percent });
+    // 只保留最近 30 个采样（先进先出，时间恒递增）
+    if (list.length > PERCENT_HISTORY_MAX) list.splice(0, list.length - PERCENT_HISTORY_MAX);
+    percentHistory.set(q.providerId, list);
+  }
+}
+
+/** 快照文件原子写（视图拉取式兜底通道） */
 function writeSnapshotFile(path, snapshot) {
   try {
     mkdirSync(dirname(path), { recursive: true });
@@ -322,29 +346,34 @@ function writeSnapshotFile(path, snapshot) {
 }
 
 /**
- * 启动轮询服务（扩展激活入口调用）。
+ * 启动轮询服务（扩展激活入口调用；测试经 intervalMs 注入短间隔覆盖 60s 节奏）。
  * @param {{intervalMs?: number, deliver?: Function, snapshotPath?: string, log?: Function,
  *          deps?: object}} opts deps 缺省时绑定真实数据源（db-reader/额度引擎）
- * @returns {{stop: Function}} 供停用
+ * @returns {{stop: Function, onGenerateEvent: Function}} stop 供停用；
+ *          onGenerateEvent 供 Task 6 绑定宿主 models.onDidGenerate 订阅
  */
 export function start(opts = {}) {
-  const intervalMs = opts.intervalMs ?? 1000;
+  const intervalMs = opts.intervalMs ?? TICK_MS;
   const log = opts.log ?? ((l) => console.log(l));
   const deps = opts.deps ?? realDeps(log);
-  const state = { cursor: 0, toolCursor: 0, rows: [], toolRows: [], prevValue: 0, emaValue: 0, asOf: 0, lastNewRowMs: null, projectBySession: {} };
-  // 防重入护栏：上一轮（HTTP/慢查询）未完成时跳过本拍——避免 setInterval 叠加并发拖垮宿主与网络栈
+  const state = createState();
+  // 防重入护栏（V1 根因教训）：上一轮（HTTP/慢查询）未完成时跳过本拍——
+  // 避免 setInterval 叠加并发拉取拖垮宿主与网络栈
   let running = false;
   const runTick = () => {
     if (running) return;
     running = true;
-    void tick(state, { ...deps, deliver: opts.deliver, snapshotPath: opts.snapshotPath, log }).finally(() => {
+    void tickV2(state, { ...deps, deliver: opts.deliver, snapshotPath: opts.snapshotPath, log }).finally(() => {
       running = false;
     });
   };
   const timer = setInterval(runTick, intervalMs);
-  // 立即跑第一轮，避免首屏等一个间隔
+  // 立即跑第一轮（首拍回填），避免首屏等一个间隔
   runTick();
-  return { stop: () => clearInterval(timer) };
+  return {
+    stop: () => clearInterval(timer),
+    onGenerateEvent: createOnGenerateEvent(state, { deliver: opts.deliver, snapshotPath: opts.snapshotPath, log }),
+  };
 }
 
 /** 读取 provider_config 文档（内存引用，不落日志；读不到返回 null） */
@@ -360,14 +389,19 @@ function readProviderDoc(path) {
 }
 
 /**
- * 额度计算：每实例 × 每窗口（规则表按家族路由）→ 官方分母优先 + 本地分子聚合。
+ * 额度计算（V2 兜底收窄）：每实例 × 每窗口（规则表按家族路由）→ 官方分母/百分比优先。
+ * 收窄裁量（§五.3）：本地分子兜底仅限 5h 窗口——bounds 由 quota.mjs windowBounds 换算
+ * （官方锚定或 [now-5h,now]），分子取小时桶整桶和（±1 小时近似，仅兜底不冒充精确）；
+ * 周/月窗口删除本地分子（24h 底座对 7d/30d 天然算不准，V1 全缓冲周分子依赖
+ * 「进程连活 7 天」属隐性失真）——官方失败 used=null，仅由 view-model 出状态句
+ * 「官方接口不可用」。
  * @param {object|null} providerDoc provider_config.json 文档（含 apiKey，仅在内存引用）
- * @param {number} now 当前时刻
- * @param {object[]} rows 环形缓冲行（本地分子）
+ * @param {number} now 当前时刻（epoch 毫秒）
+ * @param {Map} buckets 小时桶（5h 兜底分子唯一来源）
  * @param {Function} log 日志
- * @returns {Promise<object[]>} quotaRows（buildSnapshot 输入；无密钥）
+ * @returns {Promise<object[]>} quotaRows（buildSnapshotV2 输入；无密钥）
  */
-async function computeQuota(providerDoc, now, rows, log) {
+export async function computeQuota(providerDoc, now, buckets, log) {
   const rulesList = providerDoc?.config?.providerConfigRules?.providerRules;
   if (!Array.isArray(rulesList)) return [];
   const out = [];
@@ -385,18 +419,22 @@ async function computeQuota(providerDoc, now, rows, log) {
       const official = apiKeyRef
         ? await fetchLimit({ family, templateId: inst.templateId, apiKeyRef, rule, userLimit: null, log })
         : { limit: null, percent: null, nextResetMs: null, source: "unavailable" };
-      const bounds = windowBounds(rule, now, { nextResetMs: official.nextResetMs });
-      const usage = usageInWindow(rows, { providerId: inst.providerId, bounds });
-      const used = usage.input + usage.output;
+      // 本地分子仅 5h 窗口（收窄裁量见函数注释）
+      let used = null;
+      if (rule.type === "rolling-5h") {
+        const bounds = windowBounds(rule, now, { nextResetMs: official.nextResetMs });
+        const sum = windowSum(buckets, inst.providerId, bounds.startMs, bounds.endMs);
+        used = sum.in + sum.out;
+      }
+      // 官方百分比优先（与厂商窗口口径一致）；本地近似仅在「有分子且分母已知」时给出
+      const localPct = used === null ? null : percent(used, official.limit);
       computed.push({
         type: rule.type,
         used,
         limit: official.limit,
-        // 官方百分比优先（与厂商窗口口径一致）；否则本地 used/limit 近似
-        percent: official.percent ?? percent(used, official.limit),
+        percent: official.percent ?? localPct,
         source: official.source,
         nextResetMs: official.nextResetMs,
-        requests: usage.requests,
       });
     }
 
@@ -425,10 +463,14 @@ function realDeps(log) {
   if (!providerDoc) log("[看板] 未找到 provider 配置（provider_config.json），额度卡不可用");
 
   return {
+    // 首拍有界回填（近 24h 行落桶即弃）
+    fetchRecent: async (sinceMs) => (opened.db ? fetchRecentModelUsage(opened.db, opened.schema, sinceMs) : { rows: [], maxRowid: 0 }),
+    // 空窗回填守卫：回填零行时的游标初始化兜底
+    fetchMaxRowid: async () => (opened.db ? fetchMaxRowid(opened.db) : 0),
+    // 其后每拍 rowid 增量
     fetchNew: async (cursor) => (opened.db ? fetchNewModelUsage(opened.db, opened.schema, cursor) : { rows: [], nextCursor: cursor }),
-    fetchTools: async (sinceMs) => (opened.db ? fetchToolUsage(opened.db, opened.schema, sinceMs) : []),
     fetchSessions: async () => (opened.db ? fetchSessions(opened.db, opened.schema) : []),
-    fetchQuota: async (now, rows) => computeQuota(providerDoc, now, rows, log),
+    fetchQuota: async (now, buckets) => computeQuota(providerDoc, now, buckets, log),
     log,
   };
 }
@@ -438,48 +480,56 @@ function defaultSnapshotPath() {
   return join(resolveCliStorageRoot(process.env, os.homedir()), "zpowerpack", "last-snapshot.json");
 }
 
+/** 空快照的展示模型默认值：注册资源 read 在首次 deliver 前的可读形态（经真实空链路构造防形状漂移） */
+const EMPTY_DISPLAY = toDisplayModelV2(
+  buildSnapshotV2({
+    liveSnapshot: createLiveRate().snapshot(0),
+    quotaRows: [],
+    trend: trendPoints(newBuckets(), 0),
+    conclusion: null,
+    now: 0,
+  }),
+  0,
+);
+
 /**
- * 扩展激活入口：注册看板视图（entry + 注册资源）、迷你条命令、启动轮询服务。
+ * 扩展激活入口：注册看板视图（entry + 注册资源）、素条命令、启动 60s 拍与事件入口。
  *
- * 取数通道（Task 8 定案）：视图沙箱经 window.zcode 每 1s 轮询注册资源 zpowerpack://display
- * （展示模型，view-model.mjs 已完成文案映射）；zpowerpack://snapshot 保留原始快照供调试。
- * 迷你条经 slots.update 推送（同值去重防 1s 刷屏）；任何注册失败降级为 console 警告不抛出。
+ * 素条推送形态 = view-model V2 的 strip（composer.status 插槽契约 text≤40/tooltip≤200），
+ * V2 不再推送 badge（渲染组件从不消费）；宿主 models.onDidGenerate 订阅绑定与
+ * sync 资源由 Task 6 接线，本入口产出 onGenerateEvent 供其绑定。
  *
  * @param {object} ctx 扩展上下文（views/commands/slots 宿主 API）
  * @param {{intervalMs?: number, snapshotPath?: string, deps?: object, log?: Function}} opts
  *        宿主只传 ctx；opts 供测试注入（注入 deps 时不落默认快照文件，避免测试污染真机）
- * @returns {Promise<{stop: Function}>} 轮询句柄（宿主不消费；测试与运维用）
+ * @returns {Promise<{stop: Function, onGenerateEvent: Function}>} 轮询句柄
+ *          （宿主不消费返回值；测试与运维用；Task 6 取 onGenerateEvent 绑定订阅）
  */
 export async function activate(ctx, opts = {}) {
   const log = opts.log ?? ((l) => console.log(l));
 
-  // 最新快照/展示模型缓存：注册资源 read 的唯一数据源，由 tick 的 deliver 回调刷新
+  // 最新快照/展示模型缓存：注册资源 read 的唯一数据源，由 deliver 回调刷新
   let latestSnapshot = null;
   let latestDisplay = null;
-  let lastMiniKey = "";
+  let lastStripKey = "";
 
-  /** 迷你条推送：文本+徽标相同则跳过（防 1s 轮询刷屏） */
-  const pushMini = (mini) => {
-    const key = `${mini.text}|${mini.badge ?? ""}`;
-    if (key === lastMiniKey) return;
-    lastMiniKey = key;
+  /** 素条推送：文本+tooltip 相同则跳过（防 60s 拍/事件流刷屏）；V2 不推 badge（渲染侧从不消费） */
+  const pushStrip = (strip) => {
+    const key = `${strip.text}|${strip.tooltip}`;
+    if (key === lastStripKey) return;
+    lastStripKey = key;
     try {
-      ctx.slots.update("zpowerpack-mini", {
-        text: mini.text,
-        tooltip: mini.tooltip,
-        ...(mini.badge ? { badge: mini.badge } : {}),
-        visible: true,
-      });
+      ctx.slots.update("zpowerpack-mini", { text: strip.text, tooltip: strip.tooltip, visible: true });
     } catch (e) {
-      log(`[ZPowerPack] 迷你条推送失败（${e?.name || "异常"}）：${e?.message ?? ""}`);
+      log(`[ZPowerPack] 素条推送失败（${e?.name || "异常"}）：${e?.message ?? ""}`);
     }
   };
 
-  // 送达回调：双缓存刷新 + 迷你条推送（快照文件由 start 的 snapshotPath 通道写）
+  // 送达回调：双缓存刷新 + 素条推送（快照文件由 start 的 snapshotPath 通道写）
   const deliver = (snapshot) => {
     latestSnapshot = snapshot;
-    latestDisplay = toDisplayModel(snapshot, Date.now());
-    pushMini(latestDisplay.mini);
+    latestDisplay = toDisplayModelV2(snapshot, Date.now());
+    pushStrip(latestDisplay.strip);
   };
 
   try {
@@ -488,10 +538,10 @@ export async function activate(ctx, opts = {}) {
       entry: "extension/view/index.html",
       onDidOpen: () => log("[看板] 视图已打开"),
       resources: {
-        // 展示模型：沙箱 1s 轮询的唯一取数资源（文案映射已在 view-model 完成）
+        // 展示模型：视图取数资源（V2 素条/面板文案映射已在 view-model 完成）
         "zpowerpack://display": {
           mimeType: "application/json",
-          read: () => JSON.stringify(latestDisplay ?? { stage: { state: "idle", valueText: "—" }, quota: { rows: [] }, grid: {} }),
+          read: () => JSON.stringify(latestDisplay ?? EMPTY_DISPLAY),
         },
         // 原始快照：调试通道（无密钥）
         "zpowerpack://snapshot": {
@@ -505,7 +555,7 @@ export async function activate(ctx, opts = {}) {
   }
 
   try {
-    // 迷你条命令：点击状态条打开看板
+    // 素条命令：点击状态条打开看板（唯一入口）
     ctx.commands.register("zpowerpack-open-dashboard", async () => {
       await ctx.views.open("zpowerpack-dashboard");
     });

@@ -1,12 +1,13 @@
 /**
- * 看板交付面测试：manifest 扩展声明合规（修正后 schema）、activate() 宿主接线、
+ * 看板交付面测试：manifest 扩展声明合规（修正后 schema）、activate() 宿主接线（V2 素条链）、
  * V2 展示模型纯函数（素条四态逐字/厂商行环色/趋势/结论的文案映射）。
  *
  * 背景：V1 view-model 映射用例随 charts 退役删除（Task 5，映射本体待 Task 8 清零）；
- * activate/tick 用例属 main.js 契约（Task 4/6 范围处理）。宿主源码实证：
+ * tick 60s 拍/节流/防重入用例属服务层契约，随 Task 4 落在 pipeline.test.mjs。宿主源码实证：
  * - engines.zcode 校验基准 = 扩展 API 版本 1.4.0（非应用版本）
  * - slots = plugin.json 顶层对象（slot id 做键），target 单键 {view|command: id}
  * - entry 形态视图宿主只伺服 pageUri + 注册资源 → 视图单文件自包含，文案映射上移 Node 侧
+ * - composer 渲染组件不消费 badge → V2 素条推送不带 badge 字段
  */
 
 import { test } from "node:test";
@@ -15,7 +16,7 @@ import { readFileSync, existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { activate, tick, start } from "../extension/main.js";
+import { activate } from "../extension/main.js";
 import { toDisplayModelV2 } from "../extension/view-model.mjs";
 
 /** 读取插件 manifest（被测对象：仓库根 .zcode-plugin/plugin.json） */
@@ -353,7 +354,7 @@ test("界面文案禁 P50/P95（沿用护栏）", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 三、activate() 宿主接线：注册视图（entry+注册资源）、命令、迷你条；快照文件兜底保留
+// 三、activate() 宿主接线（V2）：注册视图（entry+注册资源）、命令、素条推送；快照文件兜底保留
 // ---------------------------------------------------------------------------
 
 /** 构造 mock ctx：记录 views/commands/slots 调用，模拟宿主注册表 */
@@ -370,12 +371,12 @@ function makeMockCtx() {
   };
 }
 
-/** 假数据源：单轮返回一行数据与一个额度实例（不碰真机 db/网络） */
+/** 假数据源（V2 契约）：首拍回填一行完成数据，增量/额度/会话空返回（不碰真机 db/网络） */
 function fakeDeps() {
   const now = 1732252927000;
   const row = {
+    rowid: 1,
     sessionId: "s1",
-    querySource: "main_turn",
     providerId: "bigmodel-api",
     modelId: "glm-4.7",
     status: "completed",
@@ -386,18 +387,18 @@ function fakeDeps() {
     inputTokens: 1000,
     outputTokens: 500,
     reasoningTokens: 10,
-    timeToFirstTokenMs: 300,
-    retryCount: 0,
   };
   return {
-    fetchNew: async () => ({ rows: [row], nextCursor: 1 }),
-    fetchTools: async () => [],
+    fetchRecent: async () => ({ rows: [row], maxRowid: 1 }),
+    fetchNew: async (cursor) => ({ rows: [], nextCursor: cursor }),
+    fetchMaxRowid: async () => 1,
     fetchSessions: async () => [{ id: "s1", directory: "E:\\code\\plugin\\zcode\\ZPowerPack" }],
     fetchQuota: async () => [],
+    now: () => now,
   };
 }
 
-test("activate：注册看板视图（entry 相对插件根）+ 快照与展示模型两个注册资源", async () => {
+test("activate：注册看板视图（entry 相对插件根）+ display/snapshot 两个注册资源，空态 display 可读", async () => {
   const ctx = makeMockCtx();
   const stop = await runActivateOnce(ctx);
   try {
@@ -406,59 +407,80 @@ test("activate：注册看板视图（entry 相对插件根）+ 快照与展示�
     assert.equal(id, "zpowerpack-dashboard");
     assert.equal(def.entry, "extension/view/index.html", "entry 相对插件根解析（探针 ENOENT 教训）");
     assert.equal(typeof def.onDidOpen, "function");
-    // 注册资源：display 供沙箱 1s 轮询，snapshot 供调试
+    // 注册资源：display 供视图取数（V2 展示模型 {strip, panel}），snapshot 供调试
     const display = def.resources["zpowerpack://display"];
     assert.ok(display, "缺少 zpowerpack://display 注册资源");
     assert.equal(display.mimeType, "application/json");
     const parsed = JSON.parse(display.read({ view: {} }));
-    assert.equal(parsed.stage.state, "live");
-    assert.equal(typeof parsed.generatedAt, "number");
+    assert.ok(parsed.panel && typeof parsed.panel.rate.stateText === "string", "面板速率条可读");
+    // 无事件无额度 → 素条空态（V2 展示模型形状）
+    assert.equal(parsed.strip.text, "ZPowerPack 待机");
     assert.ok(def.resources["zpowerpack://snapshot"], "保留原始快照资源（调试通道）");
   } finally {
     stop();
   }
 });
 
-test("activate：命令注册且处理函数打开看板视图；迷你条 slot 补丁合规（text≤40/badge 合法）", async () => {
+test("activate：命令注册且处理函数打开看板视图；素条 slot 补丁合规（text≤40/tooltip≤200/badge 不推）", async () => {
   const ctx = makeMockCtx();
   const stop = await runActivateOnce(ctx);
   try {
-    // 迷你条命令：点击状态条打开看板
+    // 素条命令：点击状态条打开看板
     const cmd = ctx.calls.commands.find((c) => c.id === "zpowerpack-open-dashboard");
     assert.ok(cmd, "缺少 zpowerpack-open-dashboard 命令");
     await cmd.fn({});
     assert.deepEqual(ctx.calls.opened, ["zpowerpack-dashboard"]);
-    // 迷你条补丁：宿主词表约束 text≤40 / tooltip≤200 / badge 1-9999|"dot"
+    // 素条补丁：宿主词表约束 text≤40 / tooltip≤200；V2 不再推送 badge（渲染侧从不消费）
     const slotCalls = ctx.calls.slots.filter((s) => s.id === "zpowerpack-mini");
-    assert.ok(slotCalls.length >= 1, "tick 后应推送迷你条");
+    assert.ok(slotCalls.length >= 1, "tick 后应推送素条");
     const patch = slotCalls[slotCalls.length - 1].patch;
     assert.ok(patch.text.length <= 40);
     assert.ok(patch.tooltip.length <= 200);
-    assert.ok(patch.badge === "dot" || (typeof patch.badge === "number" && patch.badge >= 1 && patch.badge <= 9999));
+    assert.ok(!("badge" in patch), "V2 素条推送不带 badge 字段");
   } finally {
     stop();
   }
 });
 
-test("activate：快照文件兜底通道保留（原子写仍生效），稳态迷你条不重复推送", async () => {
+test("activate：快照文件兜底保留；稳态素条不重复推送；生成事件点亮素条速率", async () => {
   const ctx = makeMockCtx();
   const dir = mkdtempSync(join(tmpdir(), "zp-act-"));
   const snapshotPath = join(dir, "last-snapshot.json");
   const deps = { ...fakeDeps(), now: () => 1732252927000 };
   const handle = await activate(ctx, { intervalMs: 5, snapshotPath, deps });
   try {
-    // 冷启动三态过渡（idle→held→live）允许若干次推送；等过渡完成进入稳态
     await new Promise((r) => setTimeout(r, 60));
     assert.ok(existsSync(snapshotPath), "文件兜底未写盘");
     const snap = JSON.parse(readFileSync(snapshotPath, "utf8"));
-    assert.equal(snap.rate.display.state, "live");
-    assert.equal(snap.rate.lastProviderId, "bigmodel-api", "快照带最近请求厂商（迷你条数据源）");
+    // V2 快照契约：无 charts 键；无订阅事件 → 兜底链有值
+    assert.ok(!("charts" in snap), "V2 快照无 charts 键");
+    assert.equal(snap.rate.state, "idle");
+    assert.ok(snap.rate.fallback, "无订阅事件时最新完成行进兜底链");
+    assert.equal(snap.rate.fallback.tps, 566.67, "兜底=回填行的单请求速率（510 token ÷ 900ms）");
 
-    // 稳态去重：live 值稳定后，再跑若干 tick 推送计数不应增长
-    const countBefore = ctx.calls.slots.filter((s) => s.id === "zpowerpack-mini").length;
+    // 稳态去重：无新事件/新行时素条推送计数不增长
+    const before = ctx.calls.slots.filter((s) => s.id === "zpowerpack-mini").length;
     await new Promise((r) => setTimeout(r, 40));
-    const countAfter = ctx.calls.slots.filter((s) => s.id === "zpowerpack-mini").length;
-    assert.equal(countAfter, countBefore, "稳态迷你条不应逐 tick 重复推送");
+    const after = ctx.calls.slots.filter((s) => s.id === "zpowerpack-mini").length;
+    assert.equal(after, before, "稳态素条不应逐 tick 重复推送");
+
+    // 生成事件（Task 6 绑定宿主订阅；此处直驱句柄）→ 素条点亮速率、快照转 live
+    handle.onGenerateEvent(
+      {
+        sessionId: "s1",
+        requestId: "r1",
+        model: { providerId: "bigmodel-api", modelId: "glm-4.7" },
+        phase: "streaming",
+        outputTokensPerSecond: 428,
+      },
+      1732252927100,
+    );
+    const slotCalls = ctx.calls.slots.filter((s) => s.id === "zpowerpack-mini");
+    const patch = slotCalls[slotCalls.length - 1].patch;
+    assert.equal(patch.text, "428 tok/s", "live 单流素条=速率合计（无额度水位段不编造）");
+    const snap2 = JSON.parse(readFileSync(snapshotPath, "utf8"));
+    assert.equal(snap2.rate.state, "live", "事件型 deliver 同步刷新快照文件");
+    assert.equal(snap2.rate.totalTps, 428);
   } finally {
     handle.stop();
   }
@@ -466,88 +488,15 @@ test("activate：快照文件兜底通道保留（原子写仍生效），稳态
 
 /**
  * 以注入依赖驱动 activate 若干 tick 后返回 stop 句柄。
- * activate(ctx, opts) 返回 {stop}（宿主不消费返回值；测试与运维用）。
+ * activate(ctx, opts) 返回 {stop, onGenerateEvent}（宿主消费句柄；测试直驱事件入口）。
  * @param {object} ctx mock 扩展上下文
- * @param {{snapshotPath?: string, ticks?: number, intervalMs?: number}} opts 可注入项
+ * @param {{ticks?: number, intervalMs?: number}} opts 可注入项
  * @returns {Promise<Function>} stop 句柄
  */
 async function runActivateOnce(ctx, opts = {}) {
-  const { ticks = 2, intervalMs = 5, snapshotPath } = opts;
+  const { ticks = 2, intervalMs = 5 } = opts;
   const deps = { ...fakeDeps(), now: () => 1732252927000 };
-  const handle = await activate(ctx, { intervalMs, snapshotPath, deps });
+  const handle = await activate(ctx, { intervalMs, deps });
   await new Promise((r) => setTimeout(r, intervalMs * ticks + 30));
   return handle.stop;
 }
-
-// ---------------------------------------------------------------------------
-// 四、tick 调度与节流（性能修复：真机实测打开看板导致整体卡顿的根因闭环）
-// ---------------------------------------------------------------------------
-
-/** 造可计数的假数据源（全部即时返回，带调用计数） */
-function countingDeps(nowFn) {
-  const counts = { new: 0, tools: 0, sessions: 0, quota: 0 };
-  return {
-    counts,
-    fetchNew: async () => { counts.new++; return { rows: [], nextCursor: 0 }; },
-    fetchTools: async () => { counts.tools++; return []; },
-    fetchSessions: async () => { counts.sessions++; return []; },
-    fetchQuota: async () => { counts.quota++; return []; },
-    ...(nowFn ? { now: nowFn } : {}),
-  };
-}
-
-test("tick 防重入：慢周期进行中调度器不叠加并发拉取（HTTP 叠加拖垮宿主的根因）", async () => {
-  let inFlight = 0;
-  let maxInFlight = 0;
-  const deps = {
-    fetchNew: async () => {
-      inFlight++;
-      maxInFlight = Math.max(maxInFlight, inFlight);
-      await new Promise((r) => setTimeout(r, 60));
-      inFlight--;
-      return { rows: [], nextCursor: 0 };
-    },
-    fetchTools: async () => [],
-    fetchSessions: async () => [],
-    fetchQuota: async () => [],
-  };
-  const handle = start({ intervalMs: 10, deps });
-  await new Promise((r) => setTimeout(r, 220));
-  handle.stop();
-  // 无护栏时 220ms/10ms 间隔会叠出 ~20 轮并发；有护栏任意时刻至多 1 轮在飞
-  assert.equal(maxInFlight, 1, "任意时刻至多一轮拉取在飞");
-});
-
-test("额度 TTL：窗口内多轮不打官方接口，过期后重打（5 分钟节流）", async () => {
-  let clock = 1000000;
-  const deps = countingDeps(() => clock);
-  const state = { cursor: 0, toolCursor: 0, rows: [], toolRows: [], prevValue: 0, emaValue: 0, asOf: 0, lastNewRowMs: null, projectBySession: {} };
-
-  await tick(state, deps); // 首轮即打
-  clock += 60000;
-  await tick(state, deps); // TTL 内 → 缓存
-  clock += 60000;
-  await tick(state, deps); // TTL 内 → 缓存
-  assert.equal(deps.counts.quota, 1, "5 分钟窗口内只打一次额度接口");
-
-  clock += 300000;
-  await tick(state, deps); // 过期 → 重打
-  assert.equal(deps.counts.quota, 2, "过期后重新拉官方额度");
-});
-
-test("会话节流：session 表不逐秒全量重读（30 秒节流）", async () => {
-  let clock = 1000000;
-  const deps = countingDeps(() => clock);
-  const state = { cursor: 0, toolCursor: 0, rows: [], toolRows: [], prevValue: 0, emaValue: 0, asOf: 0, lastNewRowMs: null, projectBySession: {} };
-
-  await tick(state, deps); // 首轮即读
-  clock += 10000;
-  await tick(state, deps); // 节流内 → 缓存
-  clock += 10000;
-  await tick(state, deps); // 节流内 → 缓存
-  clock += 15000;
-  await tick(state, deps); // 累计 35s > 30s → 重读
-  assert.equal(deps.counts.sessions, 2, "30 秒内 session 只全量读两次");
-  // 快照仍逐秒产出（额度/会话走缓存不阻塞速率链路）
-  assert.ok(deps.counts.new >= 4, "模型增量读取不受节流影响");
-});
