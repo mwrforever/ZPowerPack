@@ -218,7 +218,7 @@ export function buildSnapshot(input) {
 /**
  * 单个轮询周期：拉增量 → 入环形缓冲 → 裁剪 → 构建快照 → 送达视图（推送/文件兜底）。
  * 供 activate() 的定时器调用；测试直接驱动本函数。
- * @param {object} state 可变服务状态 {cursor, toolCursor, rows, prevValue, emaValue, asOf, lastNewRowMs, projectBySession}
+ * @param {object} state 可变服务状态 {cursor, toolCursor, rows, toolRows, prevValue, emaValue, asOf, lastNewRowMs, lastProviderId, projectBySession}
  * @param {{fetchNew: Function, fetchTools: Function, fetchQuota: Function, fetchSessions: Function,
  *          deliver?: Function, snapshotPath?: string, now?: Function, log?: Function}} deps 全部可注入
  */
@@ -239,16 +239,23 @@ export async function tick(state, deps) {
     const cutoff = now - BUFFER_RETAIN_MS;
     while (state.rows.length > 0 && (state.rows[0].completedAt ?? 0) < cutoff) state.rows.shift();
 
-    const [toolRows, quotaRows, sessionRows] = await Promise.all([
+    const [newToolRows, quotaRows, sessionRows] = await Promise.all([
       deps.fetchTools(state.toolCursor ?? 0),
       deps.fetchQuota(now, state.rows),
       deps.fetchSessions(),
     ]);
+    // 工具行入环形缓冲（与 model 行同口径 24h 底座——报表卡宣称「近 24 小时」，逐 tick 即弃会失真）
+    if (newToolRows.length > 0) {
+      state.toolRows.push(...newToolRows);
+      const toolCutoff = now - BUFFER_RETAIN_MS;
+      while (state.toolRows.length > 0 && (state.toolRows[0].startedAt ?? 0) < toolCutoff) state.toolRows.shift();
+      state.toolCursor = newToolRows[newToolRows.length - 1].startedAt ?? state.toolCursor ?? 0;
+    }
     if (sessionRows.length > 0) state.projectBySession = resolveProjects(sessionRows);
 
     const snapshot = buildSnapshot({
       rows: state.rows,
-      toolRows,
+      toolRows: state.toolRows,
       quotaRows,
       now,
       rateState: state,
@@ -259,7 +266,6 @@ export async function tick(state, deps) {
     state.prevValue = snapshot.rate.display.value;
     state.emaValue = snapshot.rate.windowed.genRate !== null ? snapshot.rate.windowed.genRate : state.emaValue;
     state.asOf = state.lastNewRowMs ?? state.asOf;
-    if (toolRows.length > 0) state.toolCursor = toolRows[toolRows.length - 1].startedAt ?? state.toolCursor ?? 0;
 
     // 送达：宿主推送（server factory 资源更新）与文件兜底（原子写）双通道
     if (deps.deliver) deps.deliver(snapshot);
@@ -309,7 +315,7 @@ export function start(opts = {}) {
   const intervalMs = opts.intervalMs ?? 1000;
   const log = opts.log ?? ((l) => console.log(l));
   const deps = opts.deps ?? realDeps(log);
-  const state = { cursor: 0, toolCursor: 0, rows: [], prevValue: 0, emaValue: 0, asOf: 0, lastNewRowMs: null, projectBySession: {} };
+  const state = { cursor: 0, toolCursor: 0, rows: [], toolRows: [], prevValue: 0, emaValue: 0, asOf: 0, lastNewRowMs: null, projectBySession: {} };
   const runTick = () => void tick(state, { ...deps, deliver: opts.deliver, snapshotPath: opts.snapshotPath, log });
   const timer = setInterval(runTick, intervalMs);
   // 立即跑第一轮，避免首屏等一个间隔

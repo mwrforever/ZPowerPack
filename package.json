@@ -6,6 +6,7 @@
   "description": "ZPowerPack 插件源码工程：存储迁移向导 + 用量看板（测试与 lint 用）",
   "scripts": {
     "test": "node --test",
-    "lint": "node scripts/lint.mjs"
+    "lint": "node scripts/lint.mjs",
+    "ci": "node scripts/lint.mjs && node --test"
   }
 }
