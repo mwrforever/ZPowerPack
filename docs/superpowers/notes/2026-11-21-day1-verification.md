@@ -26,26 +26,29 @@
 `host/index.js` `resolvePluginManifest`（特征串 `if("extension"in s)`）：
 
 ```jsonc
-// .zcode-plugin/plugin.json —— 基础字段与扩展声明同文件，扩展部分是 extension 子对象
+// .zcode-plugin/plugin.json —— 基础字段与扩展声明同文件，扩展部分是 extension 子对象；slots 是顶层字段（2026-11-22 二次探测修正三处）
 {
   "name": "...", "version": "...", "description": "...", "skills": "skills",
-  "extension": {
-    "engines": { "zcode": "^3.19.1" },          // 必填，^x.y.z 或 x.y.z（isExtensionEngineCompatible：^锁主版本，x.y.z 精确）
-    "main": "extension/main.js",                 // 可选；必须插件根内相对路径（不得绝对/含 ..）
-    "activationEvents": ["onAvailable"],         // 可选；onCommand:<id>/onView:<id> 会由宿主按 declares 自动补全（resolveActivationEvents）
-    "grants": ["sessions.read"],                 // 可选；词汇表见下
+  "extension": {                                   // strictObject（PVe）仅允许 engines/main/activationEvents/grants/protocols/contributes，多一个键即 invalid
+    "engines": { "zcode": "^1.4.0" },              // 必填。⚠ 对齐「扩展 API 版本」而非 zcode 应用版本：3.19.1 实测 host provides 1.4.0（首轮锁 ^3.19.1 → incompatible 被丢）
+    "main": "extension/main.js",                   // 可选；必须插件根内相对路径（不得绝对/含 ..）
+    "activationEvents": ["onAvailable"],            // 可选；onCommand:<id>/onView:<id> 会由宿主按 declares 自动补全（resolveActivationEvents）
+    "grants": ["sessions.read"],                   // 可选；词汇表见下
     "contributes": { "commands": [{"id","title"}], "views": [{"id","title","icon?","scope?"}] },
-    "protocols": {...}                           // 可选
+    "protocols": {...}                             // 可选
   },
-  "slots": [ { "id","order?","icon?","title?","target":{ "kind":"view|command|surface|tool","id" }, "slot":"nav.primary|..." } ]
+  "slots": {                                       // ⚠ 顶层字段（嵌在 extension 内会被 strict 拒）；对象按 slot id 做键（首轮误记为数组）
+    "nav.primary": [ { "id": "…", "order?": 1, "icon?": "…", "title?": "…", "target": { "view": "probe-view" } } ]
+  }
 }
 ```
 
 - 视图条目 schema（`wL`）：`{id: /^[a-z0-9._-]{1,64}$/, title: string|国际化表, icon?: /^[a-z0-9-]{1,48}$/ 名称（lucide）, scope?: 仅 "app"}`
+- slots 条目 schema（`Ece`/parseManifestSlots）：`{id 必填, target 必填, title?, icon?, order?(-1000~1000)}`；target 为「kind 做键」的**单键**对象 `{"view"|"command"|"surface"|"tool": id}`（EVe 转为 {kind,id} 入声明 slotItems）；条目引用的 view/command 必须已在 contributes 声明（WVe 交叉校验，未声明条目丢弃记 problems）
 - 激活事件正则：`^(onAvailable|onCommand:<id>|onView:<id>)$`；`onView/onCommand` 引用的 id 必须已声明
-- 校验两级（`validateExtensionManifest`）：先非严格探测 `engines.zcode` → 版本兼容检查（不满足报 incompatible）→ strictObject 全量校验 extension 子对象
-- `engines.zcode` 兼容规则（`CVe`）：`^x.y.z` → 主版本必须相同（0.x 还须次版本相同）；`x.y.z` → 精确匹配
-- 激活：宿主 `import(<main>)` → 命名或默认导出含 `activate(ctx)` → `S.activate(ctx)`，**10 秒激活超时**
+- 校验两级（`validateExtensionManifest`=vce）：先非严格探测 `engines.zcode` → 版本兼容检查（不满足报 incompatible）→ strictObject 全量校验 extension 子对象
+- `engines.zcode` 兼容规则（`CVe`）：`^x.y.z` → 主版本必须相同（0.x 还须次版本相同）且 host 版本 ≥ 基线；`x.y.z` → 精确匹配；**版本基准 = 扩展 API 版本常量（`dg`，zcode 3.19.1 = "1.4.0"）**
+- 激活：宿主 `import(<main>)` → 命名或默认导出含 `activate(ctx)` → `S.activate(ctx)`，**10 秒激活超时**；⚠ ESM 模块缓存跨声明刷新持久（卸载/重装/开关只推进声明 rev，不重启扩展宿主进程——代码变更须宿主进程重启即应用重启才生效，2026-11-22 实测）
 
 ### 2. 运行时形态与门控
 
@@ -104,26 +107,28 @@ function Zh(){ return env覆写 ?? join(Ae(), "credentials.json") }
 2. **Task 7 通道实现**：server factory + 资源订阅推送为首选；entry 形态仅作视图静态外壳。`onDidOpen` 可用
 3. **Task 8 位置 A/B**：入口 = `nav.primary` slot；迷你条 = `composer.status` slot（text+badge，明细进 tooltip；点击打开宽面板）
 4. **Plan 1 Task 2 config.mjs 增补**：`resolveCliStorageRoot` 同时导出 provider 配置路径解析（固定 `~/.zcode/v2/`，env 兜底），供 Task 4 providers.mjs 消费
-5. **版本兼容（§七）**：manifest `engines.zcode` 锁 `^3.19.1`（主版本 3 内兼容）
+5. **版本兼容（§七）**：manifest `engines.zcode` 锁 `^1.4.0`（**扩展 API 版本命名空间**，zcode 3.19.1 实测 host provides 1.4.0；与 zcode 应用版本无关——首轮 `^3.19.1` 锁法已被 11:37 激活实测推翻）
 
-## 五、探针装机记录（2026-11-22 动态实测回填——V1 判定：扩展视图路径当前不可用，走 Gen UI 兜底）
+## 五、探针装机与二次探测记录（2026-11-22——V1 判定最终反转：扩展路径可用）
 
-**实测过程**（探针 zpowerpack-probe@0.0.1，本地市场 zpowerpack-dev）：
-1. 安装即启用：config.json 在安装时刻（02:20:48.337Z）同步写入 `enabledPlugins["zpowerpack-probe@zpowerpack-dev"]=true`——安装无需人工启用，此前的"未启用"判断系日志截断误读，已更正。
-2. 装机后与**完全重启 zcode 后**，扩展宿主均未激活探针（插件缓存目录无 probe-diagnostics.json），左侧导航/会话活动栏均无入口。
-3. **扩展宿主进程从未存在**（全进程多轮扫描，含 Electron utilityProcess 形态）。
-4. mock ctx 直跑探针 activate()（系统 Node v24）成功 → **V3 ✅ node:sqlite 可用；V4 ✅ 只读打开被主进程持有的 db.sqlite（81,720 行 / 55ms，zcode 运行中实测 WAL 并发安全）**。
+### 5.1 首轮判定及其误因（上午，结论已被推翻，保留作教训）
+首轮判定「扩展宿主从未被拉起 → V1 失败 → Gen UI 兜底」，二次探测定位出三个误因：
+1. **"window-ready 从未发出"系误判**：扩展宿主进程一直存在（当前主进程 10:31:39 启动即 `forked extension host pid=33160`→`status=running`→`paired window host`，与其它 NodeService utilityProcess 同类未区分）；且"主进程不落盘日志"结论错误——真实日志在 **`~/.zcode/v2/logs/YYYY-MM-DD.log`**（按天落盘，main/host/renderer 全前缀、host-log 转发），首轮未发现该证据源，导致动态证据缺位。
+2. **激活链路发送方误记**：window-ready 的真实发送方是 **agent 宿主进程（out/host/index.js utilityProcess）的 `ks.announceReady()`**（本地服务就绪后无条件调用，经 `postToMain`→parentPort），不是"渲染端 window host"；主进程 `onHostProcessReady→trackWindowHost` 收到后 `a===0?Tt():(!o||o===D)&&ke()` 派生扩展宿主。静态链路全程无门控（`xg=zA(...)` 顶层无条件创建，`xg=null` 仅 app-quit 清理）。
+3. **探针不激活的真正根因（日志铁证）**：`[extensions] extension incompatible zpowerpack-probe@zpowerpack-dev: requires extension API ^3.19.1, host provides 1.4.0`——首轮把 `engines.zcode` 当应用版本锁 `^3.19.1`，实际校验基准是**扩展 API 版本常量 1.4.0**（独立命名空间），主版本 3≠1 直接丢声明；另伴随 manifest 两处 schema 误记（slots 位置/形状，修正见 §一 1）。
 
-**根因链（3.19.1 asar 逆向 + shim 实验闭环）**：
-- 扩展宿主 = Electron `utilityProcess` 子进程（依赖 `process.parentPort` API，纯 Node 下 undefined → 秒退，shim 实验证实）。
-- 启动链路：**渲染端 window host 发 `extension-host/window-ready` → 主进程 spawn 宿主（`a===0 ? Tt() : ke()`）→ MessageChannel pair → `attach-window` → 经端口 `setDeclarations({rev, plugins[]})` → 注册表应用声明 → `onAvailable` 激活**。
-- 宿主不自扫描插件（ExtensionRegistry 初始为空，声明全靠主进程经 attach-window 端口推送）。
-- **本机桌面端从未发出 window-ready**（宿主从未被 spawn 的直接上游），主进程不落盘日志，静默。remote client configs 中未见 extensionHost 类开关；`desktopContextPromptEnabled` 仅影响 presentationSurface，不门控宿主启动。精确到"为什么 window-ready 不发"（渲染端门控/服务端配置/构建差异）超出静态可达范围，留待上游版本观察。
+### 5.2 修正探针后的完整验证（2026-11-22 11:37-11:45 实测，全绿）
+探针 manifest（engines `^1.4.0` + slots 顶层对象形态）三副本同步修正后，插件管理页触发重解析：
+- **激活链路日志**：`static table rev=3 extensions=1 items=1 (plugins changed)` → `extension resolved` → `activating (onAvailable)` → `activated in 73ms`；卸载重装复验 rev=13→15 再次激活成功（声明重解析免重启，打开插件管理「已安装/个人」页即触发 `plugin-management.listPlugins/getPluginsOverview`）。
+- **UI 可见证据（截图实证）**：左侧主导航出现「ZPowerPack 探针」入口（nav.primary slot 渲染 ✓），角标 "1" = `slots.update` 徽标推送 ✓；点开入口 `onDidOpen` 触发 ✓（诊断记录 viewOpenInfo scope=app）。
+- **probe-diagnostics.json（扩展宿主内真实运行，非 mock）**：ctx API 面 13 组全录（views.register/open、slots.update、sessions 全套、settings、notifications、grants.request 等）；**V3 ✅ node:sqlite 可用（DatabaseSync）**；**V4 ✅ 只读打开运行中 db.sqlite：82,238 行 / 68ms**；errors=[]。
+- **views.register entry 解析基准实证**：entry 相对**插件根** join 解析（首轮探针写 `view/index.html` → ENOENT `…\0.0.1\view\index.html`；文件实在 extension/view/ 下，已改为 `extension/view/index.html` 三副本落盘）。
+- **ESM 模块缓存实证**：修正 main.js 后卸载/重装/开关仅推进声明 rev，扩展宿主进程不重启、内存模块不重载（诊断 capturedAt 恒为 11:37:26 佐证）——**扩展代码变更须扩展宿主进程重启（=应用重启）才生效**。
 
-**对计划的判定**（依据 spec §五兜底与 Plan 2 Task 9 条件）：
-- **V1 判定 = 失败（本机 3.19.1 实测）→ Task 9（Gen UI 兜底）启用，Task 8 视图实现转为 Gen UI 形态**；扩展实现（main.js/view/window-rules 等）全部保留，§七 兼容策略"降级不崩溃"成立，上游门控开放后可平替切回。
-- V1-b 结论修正：扩展宿主**存在启动门控证据**（window-ready 驱动 + desktopContextPrompt 配置入参），此前"未发现门控"仅对 fork 函数体成立。
-- 真机待办（非阻塞，留观）：devtools console 查 `[extension-host]` 日志可确认主进程是否尝试 spawn 及失败原因；上游版本若开放扩展链路，用同一探针重验。
+### 5.3 对计划的判定（修订，覆盖首轮）
+- **V1 判定 = 成功（扩展路径可用，本机 3.19.1 实测）→ Task 8 视图回归扩展形态（entry 形态 + window.zcode 桥接）、Task 9 数据服务回归扩展 main.js 形态**；Gen UI 兜底保留为 §七 降级路径（API 版本不兼容时降级不崩溃）。
+- 唯一待重启验证项（不阻塞判定，只影响 Task 8 渲染细节选型）：探针视图 HTML 在 plugin-sandbox 内实际渲染 + `window.zcode` 桥接 API 实测——entry 修复已落盘，下次应用重启后点开「ZPowerPack 探针」入口即验。
+- 探针使命完成后的卸载步骤不变（交接文档 §3.4）。
 
 ## 六、V6 额度接口调研表（2026-11-22 调研完成回填）
 
