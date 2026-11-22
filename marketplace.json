@@ -1,0 +1,16 @@
+{
+  "name": "zpowerpack-local",
+  "description": "ZPowerPack 本地开发市场：zcode 存储迁移向导与用量看板插件",
+  "owner": { "name": "ZPowerPack" },
+  "plugins": [
+    {
+      "name": "zpowerpack",
+      "source": "./",
+      "description": "ZPowerPack：zcode 存储迁移向导与用量看板——实时 token 速率、套餐额度窗口、速度/健康/时段统计，桌面端原生内嵌展示。",
+      "version": "0.1.0",
+      "author": { "name": "ZPowerPack" },
+      "category": "tools",
+      "keywords": ["存储迁移", "用量看板", "额度查询"]
+    }
+  ]
+}
