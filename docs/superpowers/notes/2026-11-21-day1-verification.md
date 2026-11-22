@@ -106,11 +106,24 @@ function Zh(){ return env覆写 ?? join(Ae(), "credentials.json") }
 4. **Plan 1 Task 2 config.mjs 增补**：`resolveCliStorageRoot` 同时导出 provider 配置路径解析（固定 `~/.zcode/v2/`，env 兜底），供 Task 4 providers.mjs 消费
 5. **版本兼容（§七）**：manifest `engines.zcode` 锁 `^3.19.1`（主版本 3 内兼容）
 
-## 五、探针装机记录（动态实测，待回填）
+## 五、探针装机记录（2026-11-22 动态实测回填——V1 判定：扩展视图路径当前不可用，走 Gen UI 兜底）
 
-- 探针源：SDD 工作区 `v1-probe/`（git 忽略，不入库；验证后整目录删除 + 用户侧卸载插件/移除市场）
-- 探针覆盖：manifest 混装校验、onAvailable 即时激活、nav.primary slot 渲染、views.register(entry+onDidOpen)、slots.update、ctx API 面、node:sqlite 导入、db 只读聚合、视图 window.zcode 探测、fetch 相对资源
-- 实测结果：待回填
+**实测过程**（探针 zpowerpack-probe@0.0.1，本地市场 zpowerpack-dev）：
+1. 安装即启用：config.json 在安装时刻（02:20:48.337Z）同步写入 `enabledPlugins["zpowerpack-probe@zpowerpack-dev"]=true`——安装无需人工启用，此前的"未启用"判断系日志截断误读，已更正。
+2. 装机后与**完全重启 zcode 后**，扩展宿主均未激活探针（插件缓存目录无 probe-diagnostics.json），左侧导航/会话活动栏均无入口。
+3. **扩展宿主进程从未存在**（全进程多轮扫描，含 Electron utilityProcess 形态）。
+4. mock ctx 直跑探针 activate()（系统 Node v24）成功 → **V3 ✅ node:sqlite 可用；V4 ✅ 只读打开被主进程持有的 db.sqlite（81,720 行 / 55ms，zcode 运行中实测 WAL 并发安全）**。
+
+**根因链（3.19.1 asar 逆向 + shim 实验闭环）**：
+- 扩展宿主 = Electron `utilityProcess` 子进程（依赖 `process.parentPort` API，纯 Node 下 undefined → 秒退，shim 实验证实）。
+- 启动链路：**渲染端 window host 发 `extension-host/window-ready` → 主进程 spawn 宿主（`a===0 ? Tt() : ke()`）→ MessageChannel pair → `attach-window` → 经端口 `setDeclarations({rev, plugins[]})` → 注册表应用声明 → `onAvailable` 激活**。
+- 宿主不自扫描插件（ExtensionRegistry 初始为空，声明全靠主进程经 attach-window 端口推送）。
+- **本机桌面端从未发出 window-ready**（宿主从未被 spawn 的直接上游），主进程不落盘日志，静默。remote client configs 中未见 extensionHost 类开关；`desktopContextPromptEnabled` 仅影响 presentationSurface，不门控宿主启动。精确到"为什么 window-ready 不发"（渲染端门控/服务端配置/构建差异）超出静态可达范围，留待上游版本观察。
+
+**对计划的判定**（依据 spec §五兜底与 Plan 2 Task 9 条件）：
+- **V1 判定 = 失败（本机 3.19.1 实测）→ Task 9（Gen UI 兜底）启用，Task 8 视图实现转为 Gen UI 形态**；扩展实现（main.js/view/window-rules 等）全部保留，§七 兼容策略"降级不崩溃"成立，上游门控开放后可平替切回。
+- V1-b 结论修正：扩展宿主**存在启动门控证据**（window-ready 驱动 + desktopContextPrompt 配置入参），此前"未发现门控"仅对 fork 函数体成立。
+- 真机待办（非阻塞，留观）：devtools console 查 `[extension-host]` 日志可确认主进程是否尝试 spawn 及失败原因；上游版本若开放扩展链路，用同一探针重验。
 
 ## 六、V6 额度接口调研表（2026-11-22 调研完成回填）
 
