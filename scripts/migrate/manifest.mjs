@@ -31,6 +31,7 @@ export function initManifest(backupRoot, opts) {
     targetRoot: opts.targetRoot,
     phases: [],
     configSnapshot: null,
+    copied: [],
   };
   writeAtomic(manifestPath, manifest);
   return manifestPath;
@@ -54,12 +55,27 @@ export function appendPhase(manifestPath, entry) {
  */
 export function snapshotConfigValues(manifestPath, original) {
   const manifest = readManifest(manifestPath);
-  const snapshot = {};
   const storage = original?.storage ?? {};
-  if (typeof storage.dir === "string") snapshot["storage.dir"] = storage.dir;
-  if (typeof storage.sessionDbPath === "string") snapshot["storage.sessionDbPath"] = storage.sessionDbPath;
-  // 双保险：只保留白名单键（当前实现天然只产生白名单键，此过滤防未来改动引入泄漏）
-  manifest.configSnapshot = Object.fromEntries(Object.entries(snapshot).filter(([k]) => SNAPSHOT_WHITELIST.has(k)));
+  // 两键恒在：不存在的原键记 null（恢复语义：null = 还原时删除该键）
+  manifest.configSnapshot = {
+    "storage.dir": typeof storage.dir === "string" ? storage.dir : null,
+    "storage.sessionDbPath": typeof storage.sessionDbPath === "string" ? storage.sessionDbPath : null,
+  };
+  // 双保险：只保留白名单键（此过滤防未来改动引入泄漏）
+  manifest.configSnapshot = Object.fromEntries(
+    Object.entries(manifest.configSnapshot).filter(([k]) => SNAPSHOT_WHITELIST.has(k)),
+  );
+  writeAtomic(manifestPath, manifest);
+}
+
+/**
+ * 记录本次迁移实际复制的条目清单（cleanup 白名单的唯一依据：仅清单内条目可被显式清理）。
+ * @param {string} manifestPath manifest 路径
+ * @param {string[]} copied 子目录名数组（如 ["rollout","exec","db"]）
+ */
+export function recordCopied(manifestPath, copied) {
+  const manifest = readManifest(manifestPath);
+  manifest.copied = [...copied];
   writeAtomic(manifestPath, manifest);
 }
 

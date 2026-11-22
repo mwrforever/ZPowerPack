@@ -6,6 +6,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { pathToFileURL } from "node:url";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -108,4 +109,50 @@ export function launchZCode(exePath, opts = {}) {
   const spawnFn = opts.spawnFn ?? spawn;
   const child = spawnFn(exePath, [], { detached: true, stdio: "ignore", windowsHide: true });
   child.unref();
+}
+
+// ---- CLI 入口（由迁移编排 main.mjs 以 detached 子进程运行）----
+// 用法：node waiter.mjs --src <旧cli根> --dest <新cli根> [--db <旧db>] [--destDb <新db>]
+//            [--notify "标题|正文"] [--launch <ZCode.exe 路径>]
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const args = process.argv.slice(2);
+  const get = (name) => {
+    const i = args.indexOf(name);
+    return i >= 0 ? args[i + 1] : undefined;
+  };
+  const src = get("--src");
+  const dest = get("--dest");
+  const dbPath = get("--db");
+  const destDbPath = get("--destDb");
+  const notify = get("--notify");
+  const launchExe = get("--launch");
+
+  if (!src || !dest) {
+    console.error("[waiter] 缺少 --src 或 --dest 参数");
+    process.exit(2);
+  }
+
+  console.log(`[waiter] 等待 ZCode 完全退出后开始增量同步：${src} → ${dest}`);
+  try {
+    await waitForExit({});
+    console.log("[waiter] ZCode 已退出，开始增量同步…");
+    await runIncrementalSync({ srcRoot: src, destRoot: dest, dbPath, destDbPath });
+    console.log("[waiter] 增量同步完成。");
+    if (notify) {
+      const [title, body] = notify.split("|");
+      try {
+        await notifyWindows(title || "ZPowerPack", body || "增量同步完成");
+        console.log("[waiter] 已发送 Windows 通知。");
+      } catch (e) {
+        console.warn(`[waiter] 通知发送失败（不影响同步结果）：${e.message}`);
+      }
+    }
+    if (launchExe) {
+      launchZCode(launchExe);
+      console.log(`[waiter] 已拉起 ${launchExe}`);
+    }
+  } catch (e) {
+    console.error(`[waiter] 执行失败：${e.message}`);
+    process.exit(1);
+  }
 }
