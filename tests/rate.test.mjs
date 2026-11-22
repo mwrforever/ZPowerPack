@@ -115,6 +115,16 @@ test("final 事件收流：流消失转 recent，lastFinal 记末值", () => {
   assert.equal(snap.lastProviderId, "zhipu");
 });
 
+test("final 事件不带 outputTokens：lastFinal.outputTokens 置 null 保形稳定（契约可选键兜底分支）", () => {
+  const live = createLiveRate();
+  const subs = new Set();
+  live.onEvent(evOf({ requestId: "r1", phase: "streaming", tps: 428 }), 1000, subs);
+  // 契约中 outputTokens 为可选键：宿主 final 载荷缺失时末值记录须保持形状稳定（null 而非 undefined）
+  live.onEvent(evOf({ requestId: "r1", phase: "final", tps: 415 }), 9000, subs);
+  const snap = live.snapshot(10000);
+  assert.deepEqual(snap.lastFinal, { modelId: "glm-4.7", tps: 415, outputTokens: null, at: 9000 });
+});
+
 test("空闲 5 分钟 → idle；recent 态保留末值不显示 0", () => {
   const live = createLiveRate();
   const subs = new Set();
