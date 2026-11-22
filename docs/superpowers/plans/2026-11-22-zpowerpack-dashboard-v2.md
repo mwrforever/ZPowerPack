@@ -79,7 +79,7 @@ git commit -m "docs: V2 订阅探针定案（onDidGenerate 绑定形态/事件�
   - 模块常量 `USED_COLS`：`rowid, session_id, provider_id, model_id, status, started_at, first_token_at, completed_at, duration_ms, input_tokens, output_tokens, reasoning_tokens`（增量与回填共用；行输出仅含这些列的 camelCase 映射）
   - `fetchNewModelUsage(db, schema, cursor)` 签名不变；`fetchRecentModelUsage(db, schema, sinceMs)` → `{ rows, maxRowid }`（`completed_at ≥ sinceMs`，ORDER BY rowid ASC，只取 USED_COLS）
   - `subagentSessionIds(sessionRows)` → `Set<string>`（parentId 非空且父在表内的 sessionId 集合）
-  - **删除**：`fetchToolUsage`、`TOOL_USAGE_MAP`、TABLES 中 `tool_usage`（工具统计已砍，死代码零容忍）
+  - **保留待清**：`fetchToolUsage`/`TOOL_USAGE_MAP` 本任务**不删**（`extension/main.js` 仍在导入，先删套件即红）；函数头加中文注释「退役：Task 4 切换导入，Task 8 清零」
 
 - [ ] **Step 1: 失败测试**
 
@@ -98,7 +98,7 @@ Expected: FAIL（`fetchRecentModelUsage is not defined` / 字段集断言不符�
 
 - [ ] **Step 3: 实现**
 
-db-reader.mjs：新增 `USED_COLS` 常量与两查询共用列选择；`subagentSessionIds` 纯函数（遍历 sessionRows 建 id 集合后判定）；删除 tool_usage 相关导出与探测。
+db-reader.mjs：新增 `USED_COLS` 常量与两查询共用列选择；`subagentSessionIds` 纯函数（遍历 sessionRows 建 id 集合后判定）；`fetchToolUsage`/`TOOL_USAGE_MAP` 保留并加退役注释（消费方 Task 4 切换，孤儿 Task 8 清）。
 
 - [ ] **Step 4: 运行确认通过**
 
@@ -162,7 +162,7 @@ git commit -m "feat: 增量小时桶（24h 趋势与 5h 兜底分子统一底座
 
 **Files:**
 - Create: `extension/core/live-rate.mjs`
-- Delete: `extension/core/rate.mjs`
+- 保留待清: `extension/core/rate.mjs`（main.js 仍在导入，本任务不删；Task 4 切换导入时删除文件）
 - Test: `tests/rate.test.mjs`（重写；旧 windowedRate/ema/displayRate 用例随口径废除删除）
 
 **Interfaces:**
@@ -192,21 +192,20 @@ it("兜底：noteFallbackRow 后 snapshot.fallback 有值，与流并存时流�
 Run: `npm test`
 Expected: FAIL（模块不存在 + 旧用例删除后计数变化）
 
-- [ ] **Step 3: 实现 live-rate.mjs 并删除 rate.mjs**
+- [ ] **Step 3: 实现 live-rate.mjs（rate.mjs 保留待 Task 4）**
 
 `Map<requestId, 流>`；final 即删流记 lastFinal；无 EMA/无窗口加权/无三态保持——展示值=官方推送值原样。
 
 - [ ] **Step 4: 全仓死代码校验**
 
 Run: `grep -rn "core/rate.mjs" extension tests`
-Expected: 无引用（main.js 将在 Task 4 切换导入）
+Expected: 仅 `extension/main.js` 一处导入残留（Task 4 切换后清零），其余无引用
 
 - [ ] **Step 5: 运行确认通过 + 提交**
 
 ```bash
 npm test
 git add extension/core/live-rate.mjs tests/rate.test.mjs
-git rm extension/core/rate.mjs
 git commit -m "feat: 实时速率改官方流式事件驱动（live-rate 状态机；EMA/窗口加权/三态保持全废）"
 ```
 
@@ -246,7 +245,7 @@ Expected: FAIL（buildSnapshotV2 未定义）
 
 - [ ] **Step 3: 实现**
 
-main.js：删除 buildSnapshot/tick/quantile/genMsOf/charts 八组计算与 BUFFER_RETAIN_MS 环形缓冲；tickV2 按 Interfaces 流程组装；writeSnapshotFile 兜底通道保留。
+main.js：删除 buildSnapshot/tick/quantile/genMsOf/charts 八组计算与 BUFFER_RETAIN_MS 环形缓冲；导入切换为 live-rate/hourly/view-model V2 与 db-reader 新函数，**切换后删除 `extension/core/rate.mjs` 文件**；tickV2 按 Interfaces 流程组装；writeSnapshotFile 兜底通道保留。
 
 - [ ] **Step 4: 运行确认通过**
 
@@ -276,7 +275,7 @@ git commit -m "feat: V2 服务层（60s 单拍/增量落桶/事件节流/结论�
     - live 单流：`428 tok/s · 5h 73%`；并行：`428+96 tok/s · 5h 73%`
     - 空闲：`智谱 5h 73% · 周 41%`（跟随最近请求厂商，取自快照 rate.lastProviderId——live-rate snapshot 需带出最近事件 providerId）
     - 无数据：`ZPowerPack 待机`
-  - **删除**：ttftHistogram、charts 全部映射（stage/speed/ttft/ctx/heat/projects/health/tools/dock）
+  - **保留待清**：V1 导出 `toDisplayModel`/`ttftHistogram` 暂留（`extension/main.js` 仍导入，先删套件即红；Task 4 切换导入、Task 8 清零）；charts 映射函数随重写消失
 - Consumes: Task 4 快照契约
 
 - [ ] **Step 1: 失败测试**
@@ -297,7 +296,7 @@ Expected: FAIL（`toDisplayModelV2 is not defined`）
 
 - [ ] **Step 3: 实现 view-model V2**
 
-保留 fmt 辅助与额度文案函数；素条四态逐字实现；charts 映射函数全删。
+保留 fmt 辅助与额度文案函数；素条四态逐字实现；charts 映射函数随重写消失；V1 导出 `toDisplayModel`/`ttftHistogram` 暂留（消费方 Task 4 切换导入，Task 8 清零）。
 
 - [ ] **Step 4: 运行确认通过**
 
@@ -402,7 +401,7 @@ git commit -m "feat: V2 卡片视图（AI Usage Widget 形态/订阅推送取数
 - [ ] **Step 1: 死代码扫描**
 
 Run: `grep -rn "windowedRate\|displayRate\|ttftHistogram\|providerHealth\|byProject\|toolStats\|fetchToolUsage\|usageInWindow" extension tests`
-Expected: 无残留（usageInWindow 随 5h 兜底改走 windowSum 而退役；windowBounds/percent 保留；历史遗留死代码按惯例指出不擅删，**本次改动产生的**必须清零）
+Expected: 无残留（usageInWindow 随 5h 兜底改走 windowSum 而退役；windowBounds/percent 保留；`extension/core/rate.mjs` 文件已随 Task 4 删除；view-model V1 导出 toDisplayModel/ttftHistogram 清零；历史遗留死代码按惯例指出不擅删，**本次改动产生的**必须清零）
 
 - [ ] **Step 2: 空库集成用例**
 
