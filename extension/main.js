@@ -1,12 +1,13 @@
 /**
  * ZPowerPack 扩展服务层：1s 轮询聚合管线 + 视图消费的唯一快照契约（buildSnapshot）。
  *
- * 架构（Plan 2 Task 1 V1 静态结论）：扩展 main 注册视图，数据经快照送达——推送（server factory
- * 资源更新，待探针动态确认 ctx 形态后接线）与拉取式文件（<cliStorageRoot>/zpowerpack/last-snapshot.json
- * 原子写）双通道就绪。运行环境 = 扩展宿主 Node 进程。
+ * 架构（Task 8 定案，V1 二次探测实证）：宿主对 entry 形态视图构建 MCP server，伺服 pageUri 之外
+ * 还伺服注册资源（tools/resources 定义，宿主源码 wM 直证）——视图经 window.zcode.readResource
+ * 轮询注册资源取数（1s，与 tick 同节奏）；快照文件（<cliStorageRoot>/zpowerpack/last-snapshot.json
+ * 原子写）保留为兜底。运行环境 = 扩展宿主 Node 进程。
  *
- * 快照字段即 Task 8 的渲染契约：rate（三态+主/子代理分列+按模型）、quota（实例×窗口）、
- * charts 七组（吞吐对比/首字等待/上下文→速率/时段热力/按项目/工具统计/厂商稳定性）。
+ * 快照字段即渲染契约：rate（三态+主/子代理分列+按模型+最近厂商）、quota（实例×窗口）、
+ * charts（吞吐/首字等待直方图/上下文→速率/时段热力/按项目/工具统计/厂商稳定性）。
  * 快照序列化结果不得含任何密钥（apiKey 只在 quota-fetch 请求头内出现，永不进入数据流）。
  */
 
@@ -20,6 +21,7 @@ import { fetchLimit } from "./core/quota-fetch.mjs";
 import { matchTemplateFamily } from "./core/providers.mjs";
 import { resolveDbPath, openDb, fetchNewModelUsage, fetchToolUsage, fetchSessions } from "./core/db-reader.mjs";
 import { resolveCliStorageRoot, resolveProviderConfigPath } from "../scripts/migrate/config.mjs";
+import { toDisplayModel, ttftHistogram } from "./view-model.mjs";
 import RULES from "./core/window-rules.json" with { type: "json" };
 
 /** 速率窗口默认值（§五：窗口时长可配置） */
@@ -93,6 +95,8 @@ export function buildSnapshot(input) {
     windowed: { genRate: windowed.genRate, throughput: windowed.throughput, sampleDurationMs: windowed.sampleDurationMs },
     byModel,
     display,
+    // 最近一次完成请求的厂商（迷你条「跟随最近请求的 provider」数据源）
+    lastProviderId: rateState.lastProviderId ?? null,
   };
 
   // ---- 额度区：透传额度引擎产出（shape 固定为视图契约）----
@@ -200,11 +204,14 @@ export function buildSnapshot(input) {
     heatmap[d.getDay()][d.getHours()] += (r.inputTokens ?? 0) + outputOf(r);
   }
 
+  // 首字等待分布直方图：真实 TTFT 分桶（锁定稿直方图视觉的诚实数据源；缺该列时空数组）
+  const ttftHist = ttftHistogram(rows);
+
   return {
     generatedAt: now,
     rate,
     quota,
-    charts: { throughput, latency, ctxVsRate, byProject, toolStats, providerHealth, heatmap },
+    charts: { throughput, latency, ttftHist, ctxVsRate, byProject, toolStats, providerHealth, heatmap },
   };
 }
 
@@ -225,6 +232,8 @@ export async function tick(state, deps) {
       state.rows.push(...newRows);
       state.cursor = nextCursor;
       state.lastNewRowMs = newRows[newRows.length - 1].completedAt ?? now;
+      // 跟随最近请求的厂商（迷你条数据源）
+      state.lastProviderId = newRows[newRows.length - 1].providerId ?? state.lastProviderId;
     }
     // 环形缓冲裁剪：仅保留 BUFFER_RETAIN_MS 内的行（24h 报表底座）
     const cutoff = now - BUFFER_RETAIN_MS;
@@ -400,20 +409,82 @@ function defaultSnapshotPath() {
 }
 
 /**
- * 扩展激活入口：注册看板视图并启动轮询服务。
- * 说明：server factory 推送通道的 ctx 形态待探针动态确认后接线；当前以 entry 视图 + 快照文件
- * 双保险起步（activate 内不抛错，任何失败降级为空态看板）。
+ * 扩展激活入口：注册看板视图（entry + 注册资源）、迷你条命令、启动轮询服务。
+ *
+ * 取数通道（Task 8 定案）：视图沙箱经 window.zcode 每 1s 轮询注册资源 zpowerpack://display
+ * （展示模型，view-model.mjs 已完成文案映射）；zpowerpack://snapshot 保留原始快照供调试。
+ * 迷你条经 slots.update 推送（同值去重防 1s 刷屏）；任何注册失败降级为 console 警告不抛出。
+ *
  * @param {object} ctx 扩展上下文（views/commands/slots 宿主 API）
+ * @param {{intervalMs?: number, snapshotPath?: string, deps?: object, log?: Function}} opts
+ *        宿主只传 ctx；opts 供测试注入（注入 deps 时不落默认快照文件，避免测试污染真机）
+ * @returns {Promise<{stop: Function}>} 轮询句柄（宿主不消费；测试与运维用）
  */
-export async function activate(ctx) {
+export async function activate(ctx, opts = {}) {
+  const log = opts.log ?? ((l) => console.log(l));
+
+  // 最新快照/展示模型缓存：注册资源 read 的唯一数据源，由 tick 的 deliver 回调刷新
+  let latestSnapshot = null;
+  let latestDisplay = null;
+  let lastMiniKey = "";
+
+  /** 迷你条推送：文本+徽标相同则跳过（防 1s 轮询刷屏） */
+  const pushMini = (mini) => {
+    const key = `${mini.text}|${mini.badge ?? ""}`;
+    if (key === lastMiniKey) return;
+    lastMiniKey = key;
+    try {
+      ctx.slots.update("zpowerpack-mini", {
+        text: mini.text,
+        tooltip: mini.tooltip,
+        ...(mini.badge ? { badge: mini.badge } : {}),
+        visible: true,
+      });
+    } catch (e) {
+      log(`[ZPowerPack] 迷你条推送失败（${e?.name || "异常"}）：${e?.message ?? ""}`);
+    }
+  };
+
+  // 送达回调：双缓存刷新 + 迷你条推送（快照文件由 start 的 snapshotPath 通道写）
+  const deliver = (snapshot) => {
+    latestSnapshot = snapshot;
+    latestDisplay = toDisplayModel(snapshot, Date.now());
+    pushMini(latestDisplay.mini);
+  };
+
   try {
-    ctx.views.register("zpowerpack-dashboard", { entry: "extension/view/index.html" });
+    ctx.views.register("zpowerpack-dashboard", {
+      // entry 相对插件根解析（V1 探针 ENOENT 实证教训）
+      entry: "extension/view/index.html",
+      onDidOpen: () => log("[看板] 视图已打开"),
+      resources: {
+        // 展示模型：沙箱 1s 轮询的唯一取数资源（文案映射已在 view-model 完成）
+        "zpowerpack://display": {
+          mimeType: "application/json",
+          read: () => JSON.stringify(latestDisplay ?? { stage: { state: "idle", valueText: "—" }, quota: { rows: [] }, grid: {} }),
+        },
+        // 原始快照：调试通道（无密钥）
+        "zpowerpack://snapshot": {
+          mimeType: "application/json",
+          read: () => JSON.stringify(latestSnapshot ?? {}),
+        },
+      },
+    });
   } catch (e) {
-    console.warn(`[ZPowerPack] 视图注册失败（${e?.name || "异常"}）：${e?.message ?? ""}`);
+    log(`[ZPowerPack] 视图注册失败（${e?.name || "异常"}）：${e?.message ?? ""}`);
   }
+
   try {
-    start({ snapshotPath: defaultSnapshotPath(), log: (l) => console.log(l) });
+    // 迷你条命令：点击状态条打开看板
+    ctx.commands.register("zpowerpack-open-dashboard", async () => {
+      await ctx.views.open("zpowerpack-dashboard");
+    });
   } catch (e) {
-    console.warn(`[ZPowerPack] 轮询服务启动失败（${e?.name || "异常"}）：${e?.message ?? ""}`);
+    log(`[ZPowerPack] 命令注册失败（${e?.name || "异常"}）：${e?.message ?? ""}`);
   }
+
+  // 测试注入 deps 时不落默认快照文件（防真机副作用）；生产无 opts 时写默认路径
+  const snapshotPath = opts.snapshotPath ?? (opts.deps ? undefined : defaultSnapshotPath());
+  const handle = start({ intervalMs: opts.intervalMs, snapshotPath, deps: opts.deps, deliver, log });
+  return handle;
 }

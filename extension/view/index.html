@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>ZPowerPack · 用量看板</title>
+<!-- 锁定稿字体（沙箱无外网时回退本地栈；数字一律 tabular-nums） -->
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Manrope:wght@400;500;700;800&display=swap" rel="stylesheet" />
+<style>
+/* ===== 锁定稿「聚焦主屏」视觉世界（方向契约 .impeccable/surfaces/dashboard.md）=====
+   近黑底 #070a12 + 电青/紫双强调 + 薄荷/琥珀状态 + 珊瑚紧张；拒绝卡片阵列与主题化装置。
+   本文件自包含（宿主只伺服 pageUri 与注册资源，外部 script src 不可用——V1 探针实证）。 */
+*{margin:0;box-sizing:border-box}
+::selection{background:rgba(110,231,255,.3)}
+html{scrollbar-color:#232b3d #070a12}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:#232b3d;border-radius:6px}
+::-webkit-scrollbar-track{background:transparent}
+body{min-width:1024px;background:#070a12;color:#e8edf6;font:14px/1.55 Manrope,"Microsoft YaHei",sans-serif;display:flex;flex-direction:column;position:relative}
+body::before{content:"";position:fixed;inset:0;background:radial-gradient(60% 34% at 24% 16%,rgba(110,231,255,.09),transparent 62%),radial-gradient(50% 30% at 80% 70%,rgba(167,139,255,.07),transparent 62%);pointer-events:none}
+:focus-visible{outline:1px solid rgba(110,231,255,.6);outline-offset:2px}
+
+/* ===== 顶栏：品牌 / 范围页签 / 实时指示 ===== */
+.top{height:54px;display:flex;align-items:center;gap:24px;padding:0 40px;position:relative;z-index:4}
+.brand{font:700 16px "Chakra Petch";letter-spacing:.1em}.brand b{color:#6ee7ff}
+.tabs{display:flex;margin-left:auto;background:rgba(22,30,48,.7);border:1px solid rgba(140,180,255,.13);border-radius:999px;padding:3px;gap:2px}
+.tab{padding:4px 15px;border-radius:999px;color:#8fa3c8;font-size:12.5px}
+.tab.on{background:rgba(110,231,255,.15);color:#6ee7ff;font-weight:700}
+.tab[aria-disabled="true"]{color:#566179;cursor:not-allowed}
+.live{font-size:12px;color:#8fa3c8}.live i{display:inline-block;width:8px;height:8px;border-radius:50%;background:#34e3a2;box-shadow:0 0 12px rgba(52,227,162,.8);margin-right:7px;vertical-align:-1px}
+.live.off i{background:#566179;box-shadow:none}
+
+/* ===== 舞台：速率巨字 + 背景 60s 速率历史线 + 三态徽标 ===== */
+.stage{position:relative;height:300px;flex-shrink:0;display:flex;align-items:flex-end;padding:0 40px 26px;overflow:hidden}
+.stage .bg{position:absolute;inset:0;background:radial-gradient(90% 90% at 30% 100%,rgba(110,231,255,.13),transparent 60%),radial-gradient(70% 80% at 90% 100%,rgba(167,139,255,.1),transparent 55%)}
+.stage svg.bgline{position:absolute;left:0;right:0;bottom:52px;width:100%;height:150px;opacity:.5}
+.stage .num{position:relative;z-index:3;font:800 128px/0.88 "Chakra Petch","Cascadia Code",Consolas,monospace;letter-spacing:-.04em;font-variant-numeric:tabular-nums;color:#f7faff;text-shadow:0 0 60px rgba(110,231,255,.35);transition:text-shadow .6s}
+.stage .num.idle{text-shadow:0 0 24px rgba(110,231,255,.12);color:#8fa3c8}
+.stage .meta{position:relative;z-index:3;margin-left:30px;padding-bottom:16px}
+.stage .meta .u{font:600 15px "Chakra Petch",Consolas,monospace;color:#8fa3c8;letter-spacing:.06em}
+.stage .meta .sub{margin-top:12px;display:flex;gap:22px;font-size:13px;color:#8fa3c8;align-items:center}
+.stage .meta .sub b{color:#e8edf6;font:700 16px "Chakra Petch",Consolas,monospace;font-variant-numeric:tabular-nums;margin-left:6px}
+.stage .meta .badge{display:inline-flex;gap:8px;align-items:center;border:1px solid rgba(255,177,77,.5);background:rgba(255,177,77,.1);color:#ffcf7a;border-radius:999px;padding:5px 14px;font-size:12px;font-weight:700;margin-top:14px}
+.stage .meta .badge.idle{border-color:rgba(140,180,255,.35);background:rgba(140,180,255,.08);color:#8fa3c8}
+/* 保持态徽标用绘制的暂停双杠（图标一律画，不用 emoji） */
+.stage .meta .badge .pause{display:inline-flex;gap:3px}.stage .meta .badge .pause i{width:3.5px;height:9px;border-radius:1px;background:currentColor}
+
+/* ===== 流光缝（唯一 authored 动效：渐变缓行） ===== */
+.seam{height:1px;background:linear-gradient(90deg,transparent,rgba(110,231,255,.4) 30%,rgba(167,139,255,.4) 70%,transparent);background-size:200% 100%;animation:seamflow 9s linear infinite}
+@keyframes seamflow{from{background-position:100% 0}to{background-position:-100% 0}}
+@media (prefers-reduced-motion:reduce){.seam{animation:none}}
+
+/* ===== 额度水位行 ===== */
+.quota{padding:18px 40px 4px}
+.qh{display:flex;align-items:baseline;gap:14px;margin-bottom:12px}
+.qh h3{font:600 13px "Chakra Petch",Consolas,monospace;letter-spacing:.16em;color:#9db4dd}
+.qh .q{font-size:12px;color:#6d7fa3}
+.qrow{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:20px}
+.pc .gn{display:flex;justify-content:space-between;align-items:baseline;font-size:13px;color:#cfe0f2;margin-bottom:8px}
+.pc .gn .src{font-size:10.5px;color:#6d7fa3}
+.pc .cfg{font-size:10.5px;color:#ffcf7a;border:1px solid rgba(255,207,122,.4);border-radius:999px;padding:2px 9px;margin-left:8px;cursor:help}
+.wl{display:flex;align-items:center;gap:10px;font-size:11.5px;color:#8fa3c8;margin:6px 0}
+.wl .t{width:86px;flex-shrink:0}.wl b{color:#e8edf6;font-variant-numeric:tabular-nums;width:34px;text-align:right}
+.wl .bar{flex:1;height:5px;border-radius:3px;background:rgba(140,180,255,.12);position:relative;overflow:hidden}
+.wl .bar i{position:absolute;inset:0 auto 0 0;border-radius:3px;transition:width .8s}
+.wl .ft{min-width:112px;width:112px;font-size:10px;color:#6d7fa3;text-align:right}
+.wl .ft.tight{color:#ffcf7a}
+
+/* ===== 2×3 无边框报表网格 ===== */
+.grid{flex:1;display:grid;grid-template-columns:1fr 1fr 1fr;grid-template-rows:auto auto;gap:0 44px;padding:14px 40px 12px;min-height:0}
+.cx{border-top:1px solid rgba(140,180,255,.14);padding:11px 2px 14px;display:flex;flex-direction:column;min-height:224px}
+.cx h4{font:600 13.5px "Chakra Petch",Consolas,monospace;color:#dbe6f5;cursor:pointer;user-select:none}
+.cx h4:hover{color:#6ee7ff}
+.cx h4 .arrow{display:inline-block;font-size:10px;color:#6d7fa3;margin-left:6px;transition:transform .25s}
+.cx.open h4 .arrow{transform:rotate(90deg)}
+.cx .q{font-size:11.5px;color:#7a8db0;margin:3px 0 8px}
+.hb{display:flex;flex-direction:column;gap:7px;flex:1;justify-content:space-evenly}
+.hb .r{display:grid;grid-template-columns:110px 1fr 70px;gap:8px;align-items:center;font-size:11px;color:#8fa3c8}
+.hb .r b{color:#e8edf6;text-align:right;font-variant-numeric:tabular-nums}
+.bar{height:4px;border-radius:2px;background:rgba(140,180,255,.13);position:relative}
+.bar i{position:absolute;inset:0 auto 0 0;border-radius:2px;transition:width .8s}
+.bar em{position:absolute;top:-2px;width:1.5px;height:8px;background:rgba(232,237,246,.5)}
+.hist{display:flex;align-items:flex-end;gap:4px;flex:1;min-height:56px}
+.hist i{flex:1;border-radius:2px 2px 0 0;background:linear-gradient(180deg,rgba(110,231,255,.75),rgba(110,231,255,.08));transition:height .8s}
+.dots{position:relative;flex:1;min-height:56px}
+.dots i{position:absolute;width:5px;height:5px;border-radius:50%;background:#6ee7ff;box-shadow:0 0 6px rgba(110,231,255,.6)}
+.dots em{position:absolute;left:2%;top:78%;width:94%;border-top:1px solid rgba(167,139,255,.55);transform:rotate(7deg);transform-origin:left}
+.heat{display:grid;grid-template-columns:repeat(24,1fr);gap:2px;flex:1;min-height:56px}
+.heat i{border-radius:2px;background:rgba(110,231,255,.09);transition:background .8s}
+.heat i.h1{background:rgba(110,231,255,.26)}.heat i.h2{background:rgba(110,231,255,.5)}.heat i.h3{background:linear-gradient(135deg,#6ee7ff,#34e3a2)}
+.foot{font-size:10px;color:#6d7fa3;margin-top:6px}
+/* 下钻区（报表卡展开：按模型实时速率 / 工具调用统计） */
+.drill{display:none;margin-top:9px;border-top:1px dashed rgba(140,180,255,.14);padding-top:8px}
+.cx.open .drill{display:block}
+.drill .dr{display:flex;justify-content:space-between;font-size:11px;color:#8fa3c8;padding:2.5px 0}
+.drill .dr b{color:#cfe0f2;font-variant-numeric:tabular-nums;font-family:"Chakra Petch",Consolas,monospace}
+.drill .dh{font:600 10.5px "Chakra Petch",Consolas,monospace;letter-spacing:.14em;color:#6d7fa3;margin-bottom:5px}
+/* 空态/骨架 */
+.empty{flex:1;display:flex;align-items:center;justify-content:center;font-size:11.5px;color:#6d7fa3;min-height:56px}
+.sk{flex:1;min-height:56px;border-radius:4px;background:linear-gradient(100deg,rgba(140,180,255,.06) 40%,rgba(140,180,255,.12) 50%,rgba(140,180,255,.06) 60%);background-size:200% 100%;animation:skl 1.2s linear infinite}
+@keyframes skl{from{background-position:120% 0}to{background-position:-20% 0}}
+
+/* ===== 视图内迷你 dock（与 composer.status 同源同规则） ===== */
+.dock{height:44px;border-top:1px solid rgba(140,180,255,.14);display:flex;align-items:center;gap:18px;padding:0 40px;background:rgba(8,12,22,.94);position:relative;z-index:5;margin-top:10px}
+.dock .k{font:600 10px "Chakra Petch",Consolas,monospace;letter-spacing:.18em;color:#6d7fa3}
+.dock b{font:700 16px "Chakra Petch",Consolas,monospace;color:#6ee7ff;font-variant-numeric:tabular-nums}
+.dock .cur{font-size:12px;color:#9db4dd}.dock .cur b{color:#e8edf6;font-family:Manrope;font-size:12.5px}
+.dock .q{display:flex;align-items:center;gap:6px;font-size:11px;color:#8fa3c8}.dock .q .bar{width:44px}
+.dock .note{margin-left:auto;font-size:11px;color:#6d7fa3}
+
+/* 加载首帧骨架覆盖（数据到达前整体占位） */
+#boot{position:fixed;inset:0;background:#070a12;display:flex;align-items:center;justify-content:center;color:#6d7fa3;font-size:13px;z-index:9;transition:opacity .4s}
+#boot.hide{opacity:0;pointer-events:none}
+</style>
+</head>
+<body>
+<div id="boot">正在连接数据通道…</div>
+<div class="top">
+  <span class="brand">Z<b>Power</b>Pack</span>
+  <div class="tabs">
+    <span class="tab on" id="tab-today">今日</span>
+    <span class="tab" id="tab-7d" aria-disabled="true" title="数据底座保留 24 小时，更长范围规划中">7 天</span>
+    <span class="tab" id="tab-30d" aria-disabled="true" title="数据底座保留 24 小时，更长范围规划中">30 天</span>
+  </div>
+  <span class="live" id="live-ind"><i></i><span id="live-text">实时 · 连接中</span></span>
+</div>
+
+<div class="stage">
+  <div class="bg"></div>
+  <svg class="bgline" viewBox="0 0 1440 150" preserveAspectRatio="none" fill="none">
+    <defs>
+      <linearGradient id="pg" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0" stop-color="#6ee7ff" stop-opacity="0"/>
+        <stop offset=".4" stop-color="#6ee7ff" stop-opacity=".8"/>
+        <stop offset="1" stop-color="#a78bfa" stop-opacity=".9"/>
+      </linearGradient>
+    </defs>
+    <path id="ratepath" d="" stroke="url(#pg)" stroke-width="2.5"/>
+    <path id="ratefill" d="" fill="url(#pg)" opacity=".07"/>
+  </svg>
+  <span class="num" id="stg-num">—</span>
+  <div class="meta">
+    <div class="u">tok/s · 每秒生成的 token 数</div>
+    <div class="sub">
+      <span>主会话<b id="stg-main">—</b></span>
+      <span>subagent<b id="stg-sub">—</b></span>
+      <span>最近 60 秒 · 时长加权</span>
+    </div>
+    <div id="stg-badge" style="display:none"></div>
+  </div>
+</div>
+
+<div class="seam"></div>
+
+<div class="quota">
+  <div class="qh">
+    <h3>额度水位</h3>
+    <span class="q" id="quota-note">各窗口还能用多少？多久恢复？—— 已用百分比 · 60%/85% 双色警示</span>
+  </div>
+  <div class="qrow" id="quota-row"></div>
+</div>
+
+<div class="grid">
+  <div class="cx" id="cx-speed">
+    <h4>模型速度对比<span class="arrow">▶</span></h4>
+    <div class="q">哪家模型平时吐字快？慢起来会多慢？</div>
+    <div class="hb" id="speed-rows"></div>
+    <div class="foot" id="speed-foot">亮段=典型速度 · 白刻度=慢的时候</div>
+    <div class="drill"><div class="dh">实时按模型 · 60 秒窗口</div><div id="speed-drill"></div></div>
+  </div>
+  <div class="cx" id="cx-ttft">
+    <h4>首字等待</h4>
+    <div class="q">按下发送后，要等多久才蹦出第一个字？</div>
+    <div class="hist" id="ttft-hist"></div>
+    <div class="foot" id="ttft-foot">暂无首字等待数据</div>
+  </div>
+  <div class="cx" id="cx-ctx">
+    <h4>对话越长会变慢吗</h4>
+    <div class="q">上下文变大时的速度变化</div>
+    <div class="dots" id="ctx-dots"><em></em></div>
+    <div class="foot" id="ctx-foot">样本积累中，暂不足以判断</div>
+  </div>
+  <div class="cx" id="cx-heat">
+    <h4>时段热力</h4>
+    <div class="q">一天里什么时候用得最凶？</div>
+    <div class="heat" id="heat-cells"></div>
+    <div class="foot" id="heat-foot">暂无时段数据</div>
+  </div>
+  <div class="cx" id="cx-proj">
+    <h4>按项目消耗</h4>
+    <div class="q">每个项目各花了多少？</div>
+    <div class="hb" id="proj-rows"></div>
+    <div class="foot" id="proj-foot">近 24 小时 · subagent 归入父项目</div>
+  </div>
+  <div class="cx" id="cx-health">
+    <h4>谁家更不容易翻车<span class="arrow">▶</span></h4>
+    <div class="q">失败与自动重试的比例 · 近 24 小时</div>
+    <div class="hb" id="health-rows"></div>
+    <div class="foot" id="health-foot">失败率 · 悬停看重试率</div>
+    <div class="drill"><div class="dh">工具调用统计 · 近 24 小时</div><div id="tools-drill"></div></div>
+  </div>
+</div>
+
+<div class="dock">
+  <span class="k">迷你常驻态</span>
+  <span class="cur">最近请求：<b id="dock-provider">—</b></span>
+  <b id="dock-rate">— tok/s</b>
+  <span id="dock-windows" style="display:flex;gap:18px"></span>
+  <span class="note" id="dock-note">跟随最近请求的厂商 · 点击会话区状态条可回到本看板</span>
+</div>
+
+<script>
+"use strict";
+/* 沙箱侧哑渲染：唯一取数通道 = 注册资源 zpowerpack://display（1s 轮询，与扩展 tick 同节奏）。
+   全部文案/阈值/格式化已在扩展侧 view-model 完成；本脚本只做 DOM 绑定与 60s 速率历史积累。 */
+
+var HISTORY_MAX = 60;                     // 舞台背景线保留 60 个采样点（约 60 秒）
+var rateHistory = [];                     // [{v:number}] 采样序列（值为 null 的点跳过）
+var el = function (id) { return document.getElementById(id); };
+var lastBadged = null;                    // 徽标节点复用（避免每秒重建）
+
+/** 注册资源读取：宿主 MCP 桥接（探针实证 window.zcode 于 entry 视图可用） */
+function readDisplay() {
+  var z = window.zcode;
+  if (!z || typeof z.readResource !== "function") return Promise.reject(new Error("window.zcode 不可用"));
+  return z.readResource("zpowerpack://display").then(function (resp) {
+    var text = resp && resp.contents && resp.contents[0] && resp.contents[0].text;
+    if (!text) throw new Error("资源响应为空");
+    return JSON.parse(text);
+  });
+}
+
+/** 舞台背景速率线：由客户端逐秒积累的采样生成贝塞尔路径（无数据时清空） */
+function drawRateLine() {
+  var pts = rateHistory.filter(function (p) { return typeof p.v === "number" && p.v >= 0; });
+  var path = document.getElementById("ratepath");
+  var fill = document.getElementById("ratefill");
+  if (pts.length < 2) { path.setAttribute("d", ""); fill.setAttribute("d", ""); return; }
+  var maxV = Math.max.apply(null, pts.map(function (p) { return p.v; })) * 1.08 || 1;
+  var step = 1440 / (HISTORY_MAX - 1);
+  var x = 1440 - (pts.length - 1) * step; // 从右往左排布，新数据在右侧
+  var d = "M" + x.toFixed(1) + "," + (150 - (pts[0].v / maxV) * 130).toFixed(1);
+  for (var i = 1; i < pts.length; i++) {
+    var nx = x + i * step;
+    var ny = 150 - (pts[i].v / maxV) * 130;
+    var mx = (nx - step / 2).toFixed(1);
+    d += " C" + mx + "," + (150 - (pts[i - 1].v / maxV) * 130).toFixed(1) + " " + mx + "," + ny.toFixed(1) + " " + nx.toFixed(1) + "," + ny.toFixed(1);
+  }
+  path.setAttribute("d", d);
+  fill.setAttribute("d", d + " L1440,150 L" + x.toFixed(1) + ",150 Z");
+}
+
+/** 舞台：巨字 / 主子分列 / 三态徽标（徽标用绘制的暂停双杠，不用 emoji） */
+function renderStage(dm) {
+  var num = el("stg-num");
+  num.textContent = dm.stage.valueText;
+  num.className = "num" + (dm.stage.state === "idle" ? " idle" : "");
+  el("stg-main").textContent = dm.stage.main === null ? "—" : dm.stage.main;
+  el("stg-sub").textContent = dm.stage.subagent === null ? "—" : dm.stage.subagent;
+
+  var badge = el("stg-badge");
+  if (dm.stage.badgeText) {
+    badge.style.display = "inline-flex";
+    badge.className = "meta badge" + (dm.stage.state === "idle" ? " idle" : "");
+    if (lastBadged !== dm.stage.state) {
+      badge.innerHTML = (dm.stage.state === "held" ? '<span class="pause"><i></i><i></i></span>' : "") + "<span>" + dm.stage.badgeText + "</span>";
+      lastBadged = dm.stage.state;
+    } else {
+      var span = badge.querySelector("span:last-child");
+      if (span) span.textContent = dm.stage.badgeText;
+    }
+  } else {
+    badge.style.display = "none";
+    lastBadged = null;
+  }
+
+  // 采样积累（live 记实际值；held/idle 不推进历史线，避免假波动）
+  var numeric = parseFloat(dm.stage.valueText);
+  if (dm.stage.state === "live" && !isNaN(numeric)) {
+    rateHistory.push({ v: numeric });
+    if (rateHistory.length > HISTORY_MAX) rateHistory.shift();
+  }
+  drawRateLine();
+
+  // 实时指示
+  var ind = el("live-ind");
+  ind.className = "live" + (dm.stage.state === "live" ? "" : " off");
+  el("live-text").textContent = (dm.stage.state === "live" ? "实时 · " : "") + dm.stage.asOfText;
+}
+
+/** 额度水位行（数据驱动实例与窗口；needsConfig 出提示徽标） */
+function renderQuota(dm) {
+  var row = el("quota-row");
+  if (!dm.quota.rows || dm.quota.rows.length === 0) {
+    row.innerHTML = '<div class="pc"><div class="empty">' + (dm.quota.emptyText || "暂无额度数据") + "</div></div>";
+    return;
+  }
+  var html = "";
+  dm.quota.rows.forEach(function (pc) {
+    html += '<div class="pc"><div class="gn"><span>' + esc(pc.name) +
+      (pc.needsConfig ? '<span class="cfg" title="官方未提供分母；后续版本可在插件设置配置默认额度">配置分母</span>' : "") +
+      '</span><span class="src">' + esc(pc.srcLabel) + "</span></div>";
+    pc.windows.forEach(function (w) {
+      html += '<div class="wl"><span class="t">' + esc(w.label) + '</span><span class="bar"><i style="width:' +
+        (w.pct === null ? 0 : Math.min(100, w.pct)) + "%;background:" + w.barColor + '"></i></span><b>' +
+        (w.pct === null ? "—" : w.pct + "%") + '</b><span class="ft' + (w.footText.indexOf("紧张") >= 0 ? " tight" : "") + '">' + esc(w.footText) + "</span></div>";
+    });
+    html += "</div>";
+  });
+  row.innerHTML = html;
+}
+
+/** 报表行（速度/项目/健康三卡共用条形行结构） */
+function barRows(rows, hoverKey) {
+  if (!rows || rows.length === 0) return '<div class="empty">暂无数据</div>';
+  var html = "";
+  rows.forEach(function (r) {
+    var h = hoverKey ? ' title="' + esc(r[hoverKey]) + '"' : "";
+    html += '<div class="r"' + h + "><span>" + esc(r.label) + '</span><span class="bar"><i style="width:' +
+      r.widthPct + "%;background:" + r.color + '">' + (r.markerLeft ? '<em style="left:' + r.markerLeft + '%"></em>' : "") +
+      "</i></span><b>" + esc(r.valueText) + "</b></div>";
+  });
+  return html;
+}
+
+/** 六张报表卡（hasData=false 给空态；下钻区由卡片标题点击展开） */
+function renderGrid(dm) {
+  var g = dm.grid;
+
+  el("speed-rows").innerHTML = g.speed.hasData ? barRows(g.speed.rows) : '<div class="empty">暂无模型样本</div>';
+  el("speed-foot").textContent = g.speed.hasData ? g.speed.foot : "完成一次请求后开始统计";
+  el("speed-drill").innerHTML = (g.speed.detail && g.speed.detail.length)
+    ? g.speed.detail.map(function (d) {
+        return '<div class="dr"><span>' + esc(d.modelId) + "</span><b>" + (d.genRateText === null ? "—" : d.genRateText) + " tok/s</b></div>";
+      }).join("")
+    : '<div class="dr"><span>窗口内暂无在跑模型</span><b>—</b></div>';
+
+  el("ttft-hist").innerHTML = g.ttft.hasData
+    ? g.ttft.hist.map(function (h) { return '<i style="height:' + Math.max(3, h) + '%"></i>'; }).join("")
+    : '<div class="empty">暂无首字等待数据</div>';
+  el("ttft-foot").textContent = g.ttft.foot;
+
+  if (g.ctx.hasData) {
+    el("ctx-dots").innerHTML = g.ctx.dots.map(function (d) {
+      return '<i style="left:' + d.left + "%;top:" + d.top + '%"></i>';
+    }).join("") + "<em></em>";
+  } else {
+    el("ctx-dots").innerHTML = '<div class="empty">样本积累中</div>';
+  }
+  el("ctx-foot").textContent = g.ctx.foot;
+
+  el("heat-cells").innerHTML = g.heat.hasData
+    ? g.heat.cells.map(function (c) { return '<i class="' + c.level + '"></i>'; }).join("")
+    : '<div class="empty">暂无时段数据</div>';
+  el("heat-foot").textContent = g.heat.foot;
+
+  el("proj-rows").innerHTML = g.projects.hasData ? barRows(g.projects.rows) : '<div class="empty">暂无项目消耗</div>';
+  el("proj-foot").textContent = g.projects.foot;
+
+  el("health-rows").innerHTML = g.health.hasData ? barRows(g.health.rows, "hover") : '<div class="empty">暂无稳定性样本</div>';
+  el("health-foot").textContent = g.health.foot;
+  el("tools-drill").innerHTML = (g.tools && g.tools.length)
+    ? g.tools.map(function (t) {
+        return '<div class="dr"><span>' + esc(t.label) + " ×" + t.calls + (t.errors ? '（失败 ' + t.errors + "）" : "") +
+          "</span><b>" + (t.avgMs === null ? "—" : t.avgMs) + " ms 均耗</b></div>";
+      }).join("")
+    : '<div class="dr"><span>暂无工具调用记录</span><b>—</b></div>';
+}
+
+/** 视图内 dock（与 composer.status 迷你条同源同规则） */
+function renderDock(dm) {
+  el("dock-provider").textContent = dm.dock.providerName;
+  el("dock-rate").textContent = dm.dock.rateText;
+  el("dock-windows").innerHTML = (dm.dock.windows || []).map(function (w) {
+    return '<span class="q">' + esc(w.shortLabel) + '<span class="bar"><i style="width:' +
+      (w.pct === null ? 0 : Math.min(100, w.pct)) + "%;background:" + w.barColor + '"></i></span>' +
+      (w.pct === null ? "—" : w.pct + "%") + "</span>";
+  }).join("");
+  el("dock-note").textContent = dm.dock.followNote + " · 点击会话区状态条可回到本看板";
+}
+
+/** HTML 转义（展示模型里的名称类字段一律过此関） */
+function esc(s) {
+  return String(s === null || s === undefined ? "—" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+/** 渲染入口：首次数据到达后解除 boot 覆盖 */
+var booted = false;
+function render(dm) {
+  if (!dm || !dm.stage) return;
+  if (!booted) { booted = true; document.getElementById("boot").classList.add("hide"); }
+  renderStage(dm);
+  renderQuota(dm);
+  renderGrid(dm);
+  renderDock(dm);
+}
+
+/** 主循环：1s 轮询注册资源；连续失败进入降级提示（不伪装成空数据） */
+var failCount = 0;
+function poll() {
+  readDisplay()
+    .then(function (dm) { failCount = 0; render(dm); })
+    .catch(function (e) {
+      failCount++;
+      if (!booted) {
+        document.getElementById("boot").textContent = "数据通道连接中…（" + (e && e.message ? e.message : "未知错误") + "）";
+      } else if (failCount === 5) {
+        el("live-text").textContent = "通道中断 · 重试中";
+        el("live-ind").className = "live off";
+      }
+    });
+}
+poll();
+setInterval(poll, 1000);
+
+/** 报表卡下钻：点击卡片标题切换展开（速度→按模型实时；健康→工具统计） */
+["cx-speed", "cx-health"].forEach(function (id) {
+  var card = document.getElementById(id);
+  card.querySelector("h4").addEventListener("click", function () { card.classList.toggle("open"); });
+});
+</script>
+</body>
+</html>

@@ -4,5 +4,26 @@
   "description": "ZPowerPack：zcode 存储迁移向导与用量看板——实时 token 速率、套餐额度窗口、速度/健康/时段统计，桌面端原生内嵌展示。",
   "author": { "name": "ZPowerPack" },
   "license": "MIT",
-  "skills": "skills"
+  "skills": "skills",
+  "extension": {
+    "engines": { "zcode": "^1.4.0" },
+    "main": "extension/main.js",
+    "activationEvents": ["onAvailable"],
+    "contributes": {
+      "views": [
+        { "id": "zpowerpack-dashboard", "title": "ZPowerPack 看板", "icon": "activity", "scope": "app" }
+      ],
+      "commands": [
+        { "id": "zpowerpack-open-dashboard", "title": "打开 ZPowerPack 看板" }
+      ]
+    }
+  },
+  "slots": {
+    "nav.primary": [
+      { "id": "zpowerpack-nav", "order": 1, "icon": "activity", "title": "ZPowerPack 看板", "target": { "view": "zpowerpack-dashboard" } }
+    ],
+    "composer.status": [
+      { "id": "zpowerpack-mini", "order": 1, "title": "用量速览", "target": { "command": "zpowerpack-open-dashboard" } }
+    ]
+  }
 }
