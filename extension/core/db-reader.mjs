@@ -73,6 +73,18 @@ const TOOL_USAGE_MAP = {
   output_bytes: "outputBytes",
 };
 
+/** session 表全量列 → camelCase 行字段映射（E1：按项目统计的关联表） */
+const SESSION_MAP = {
+  id: "id",
+  directory: "directory",
+  path: "path",
+  title: "title",
+  project_id: "projectId",
+  parent_id: "parentId",
+  time_created: "timeCreated",
+  time_updated: "timeUpdated",
+};
+
 /** 三张遥测表名（探测与查询用） */
 const TABLES = ["model_usage", "turn_usage", "tool_usage"];
 
@@ -167,6 +179,31 @@ export function fetchToolUsage(db, schema, sinceMs) {
   return raw.map((r) => {
     const row = {};
     for (const c of cols) row[TOOL_USAGE_MAP[c]] = r[c];
+    return row;
+  });
+}
+
+/**
+ * 读取 session 表（按项目统计的关联数据：directory/parent 链由服务层归并）。
+ * @param {DatabaseSync|null} db openDb 返回的连接
+ * @param {{toolUsage?: Set<string>, session?: Set<string>}} schema 列探测结果
+ * @returns {object[]} camelCase 行数组；session 表不存在（探测集中未含）→ 空数组
+ */
+export function fetchSessions(db, schema) {
+  if (!db) return [];
+  // openDb 探测的是三张遥测表；session 表单独探测（缺表 → 空数组，按项目统计降级为未知项目）
+  let cols;
+  try {
+    cols = db.prepare("PRAGMA table_info(session)").all().map((c) => c.name);
+  } catch {
+    return [];
+  }
+  const present = Object.keys(SESSION_MAP).filter((c) => cols.includes(c));
+  if (present.length === 0) return [];
+  const raw = db.prepare(`SELECT ${present.map((c) => `"${c}"`).join(", ")} FROM session`).all();
+  return raw.map((r) => {
+    const row = {};
+    for (const c of present) row[SESSION_MAP[c]] = r[c];
     return row;
   });
 }
