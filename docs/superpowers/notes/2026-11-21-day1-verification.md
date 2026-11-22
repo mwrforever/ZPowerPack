@@ -124,10 +124,11 @@ function Zh(){ return env覆写 ?? join(Ae(), "credentials.json") }
 - **probe-diagnostics.json（扩展宿主内真实运行，非 mock）**：ctx API 面 13 组全录（views.register/open、slots.update、sessions 全套、settings、notifications、grants.request 等）；**V3 ✅ node:sqlite 可用（DatabaseSync）**；**V4 ✅ 只读打开运行中 db.sqlite：82,238 行 / 68ms**；errors=[]。
 - **views.register entry 解析基准实证**：entry 相对**插件根** join 解析（首轮探针写 `view/index.html` → ENOENT `…\0.0.1\view\index.html`；文件实在 extension/view/ 下，已改为 `extension/view/index.html` 三副本落盘）。
 - **ESM 模块缓存实证**：修正 main.js 后卸载/重装/开关仅推进声明 rev，扩展宿主进程不重启、内存模块不重载（诊断 capturedAt 恒为 11:37:26 佐证）——**扩展代码变更须扩展宿主进程重启（=应用重启）才生效**。
+- **重启终验（12:24）**：新主进程 `forked extension host pid=37384` → 探针 `activated in 68ms`（capturedAt 刷新 12:24:43=修复代码已加载）→ 用户点入口 `nav.primary open` → `view opened` → `view prepared` → `port attached` → **`page initialized`（视图 HTML 在 plugin-sandbox 渲染成功）**；window.zcode 桥接实证——页面 `readResource(location.href)` 请求经桥接抵达宿主 `extension-views.viewRequest`，返回 `ProtocolError: unknown view resource`（桥接通；沙箱 URL 非注册资源属预期边界）。
 
 ### 5.3 对计划的判定（修订，覆盖首轮）
-- **V1 判定 = 成功（扩展路径可用，本机 3.19.1 实测）→ Task 8 视图回归扩展形态（entry 形态 + window.zcode 桥接）、Task 9 数据服务回归扩展 main.js 形态**；Gen UI 兜底保留为 §七 降级路径（API 版本不兼容时降级不崩溃）。
-- 唯一待重启验证项（不阻塞判定，只影响 Task 8 渲染细节选型）：探针视图 HTML 在 plugin-sandbox 内实际渲染 + `window.zcode` 桥接 API 实测——entry 修复已落盘，下次应用重启后点开「ZPowerPack 探针」入口即验。
+- **V1 判定 = 成功且全项收官（重启终验通过）→ Task 8 视图回归扩展形态、Task 9 数据服务回归扩展 main.js 形态**；Gen UI 兜底保留为 §七 降级路径（API 版本不兼容时降级不崩溃）。
+- **Task 8 渲染定案**：视图用 entry 形态（plugin-sandbox 渲染实证）；取数走 **server factory + 注册资源**（callTool/readResource 仅限注册 URI——探针 readResource 沙箱 URL 返回 unknown view resource，沙箱页面 URL 不可直接作资源读）。
 - 探针使命完成后的卸载步骤不变（交接文档 §3.4）。
 
 ## 六、V6 额度接口调研表（2026-11-22 调研完成回填）
