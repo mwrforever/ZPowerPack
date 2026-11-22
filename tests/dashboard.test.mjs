@@ -1,8 +1,9 @@
 /**
  * 看板交付面测试：manifest 扩展声明合规（修正后 schema）、activate() 宿主接线、
- * 以及 view-model 纯函数（快照 → 展示模型的全部文案映射/阈值/格式化）。
+ * V2 展示模型纯函数（素条四态逐字/厂商行环色/趋势/结论的文案映射）。
  *
- * 背景：V1 二次探测反转（notes §五）后 Task 8 回归扩展形态。宿主源码实证：
+ * 背景：V1 view-model 映射用例随 charts 退役删除（Task 5，映射本体待 Task 8 清零）；
+ * activate/tick 用例属 main.js 契约（Task 4/6 范围处理）。宿主源码实证：
  * - engines.zcode 校验基准 = 扩展 API 版本 1.4.0（非应用版本）
  * - slots = plugin.json 顶层对象（slot id 做键），target 单键 {view|command: id}
  * - entry 形态视图宿主只伺服 pageUri + 注册资源 → 视图单文件自包含，文案映射上移 Node 侧
@@ -15,7 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { activate, tick, start } from "../extension/main.js";
-import { toDisplayModel } from "../extension/view-model.mjs";
+import { toDisplayModelV2 } from "../extension/view-model.mjs";
 
 /** 读取插件 manifest（被测对象：仓库根 .zcode-plugin/plugin.json） */
 function readManifest() {
@@ -69,230 +70,286 @@ test("manifest：main 为插件根内相对路径（不得绝对/含 ..）", () 
 });
 
 // ---------------------------------------------------------------------------
-// 二、view-model：快照 → 展示模型（锁定稿「聚焦主屏」的文案/阈值/格式化契约）
+// 二、V2 展示模型：素条四态逐字 + 面板四区（设计稿 §五 为构图权威，§五.6 表格为素条唯一权威）
 // ---------------------------------------------------------------------------
 
-/** 造一份有代表性的快照（live 态、三厂商额度、各卡有数据） */
-function makeSnapshot(now = 1732252927000) {
+/** 造一份 V2 快照（Task 4 buildSnapshotV2 契约形状）：live 单主流量 + 三厂商额度 + 24 点趋势 + 外推结论 */
+function makeV2Snapshot(now = 1732252927000) {
   return {
     generatedAt: now,
     rate: {
-      main: { genRate: 312.4, throughput: null },
-      subagent: { genRate: 116.2, throughput: null },
-      windowed: { genRate: 428.6, throughput: null, sampleDurationMs: 4210 },
-      byModel: [
-        { modelId: "glm-4.7", genRate: 200.1, throughput: null, lastCompletedAt: now - 1000 },
-      ],
-      display: { value: 428.6, state: "live", asOf: now },
+      state: "live",
+      streams: [{ requestId: "req-1", modelId: "glm-4.7", providerId: "bigmodel-api", isSub: false, tps: 428, phase: "streaming" }],
+      totalTps: 428,
+      subTps: 0,
+      lastEventAt: now,
       lastProviderId: "bigmodel-api",
+      lastFinal: null,
+      fallback: null,
     },
     quota: [
       {
         providerId: "bigmodel-api",
-        name: "智谱 GLM Coding",
+        name: "智谱",
         windows: [
-          { type: "rolling-5h", percent: 45, used: 9.1e6, limit: 2.0e7, source: "official", nextResetMs: now + 7920000 },
-          { type: "weekly", percent: 12, used: 2.4e7, limit: 2.0e8, source: "official", nextResetMs: now + 3 * 86400000 },
+          { type: "rolling-5h", percent: 73, used: 9.1e6, limit: 2.0e7, source: "official", nextResetMs: now + 7920000 },
+          { type: "weekly", percent: 41, used: 2.4e7, limit: 2.0e8, source: "official", nextResetMs: now + 187200000 },
         ],
-        percent: 45,
+        nextResetMs: now + 7920000,
+        percent: 73,
         source: "official",
       },
       {
         providerId: "kimi-code-cn",
-        name: "Kimi Code",
+        name: "Kimi",
         windows: [
-          { type: "rolling-5h", percent: 62, used: 6.2e6, limit: 1.0e7, source: "official", nextResetMs: now + 11100000 },
-          { type: "monthly", percent: 34, used: 1.7e7, limit: 5.0e7, source: "configured", nextResetMs: null },
+          { type: "rolling-5h", percent: 12, used: 6.2e6, limit: 1.0e7, source: "official", nextResetMs: now + 3 * 86400000 },
+          { type: "monthly", percent: 27, used: 1.7e7, limit: 5.0e7, source: "configured", nextResetMs: null },
         ],
-        percent: 62,
+        nextResetMs: now + 3 * 86400000,
+        percent: 12,
         source: "official",
       },
       {
         providerId: "opencode-go",
-        name: "OpenCode Go",
+        name: "OpenCode",
         windows: [
-          { type: "rolling-5h", percent: 86, used: null, limit: null, source: "official", nextResetMs: now + 6000000 },
-          { type: "weekly", percent: 57, used: null, limit: null, source: "official", nextResetMs: now + 86400000 },
+          { type: "rolling-5h", percent: 86, used: null, limit: null, source: "official", nextResetMs: now + 21600000 },
+          { type: "weekly", percent: 57, used: null, limit: null, source: "official", nextResetMs: now + 108000000 },
           { type: "monthly", percent: 28, used: null, limit: null, source: "official", nextResetMs: now + 20 * 86400000 },
         ],
+        nextResetMs: now + 21600000,
         percent: 86,
         source: "official",
       },
     ],
-    charts: {
-      throughput: [
-        { modelId: "glm-4.7", tpsP50: 108.2, tpsP95: 165.4, avgLatencyMs: 812, samples: 40 },
-        { modelId: "kimi-k3", tpsP50: 96.0, tpsP95: 140.0, avgLatencyMs: null, samples: 25 },
-      ],
-      latency: [
-        { modelId: "glm-4.7", ttftP50: 1300, ttftP95: 5200, samples: 40 },
-        { modelId: "kimi-k3", ttftP50: 1800, ttftP95: 6100, samples: 25 },
-      ],
-      ttftHist: [3, 9, 14, 8, 4, 2, 1, 0, 1, 1],
-      ctxVsRate: [
-        { inputTokens: 2000, tps: 150, modelId: "glm-4.7" },
-        { inputTokens: 40000, tps: 130, modelId: "glm-4.7" },
-        { inputTokens: 120000, tps: 123, modelId: "glm-4.7" },
-      ],
-      byProject: [
-        { project: "ZPowerPack", tokens: 18.2e6, requests: 210 },
-        { project: "网关后端", tokens: 10.3e6, requests: 96 },
-      ],
-      toolStats: [
-        { toolName: "Bash", calls: 88, errors: 2, totalDurationMs: 44000, avgDurationMs: 500 },
-      ],
-      providerHealth: [
-        { providerId: "bigmodel-api", requests: 100, errorRate: 0.004, retryRate: 0.02 },
-        { providerId: "opencode-go", requests: 50, errorRate: 0.023, retryRate: 0.08 },
-      ],
-      heatmap: Array.from({ length: 7 }, (_, d) => Array.from({ length: 24 }, (_, h) => (d === 3 && h >= 21 && h <= 22 ? 1e6 : 0))),
-    },
+    // 24 点升序小时桶（Task 2 trendPoints 口径）：仅 21 点位有量，验证序号映射与累计
+    trend: Array.from({ length: 24 }, (_, i) => ({ hourMs: now - (23 - i) * 3600000, tokens: i === 21 ? 8.2e6 : 0 })),
+    conclusion: { instanceName: "智谱", pctNow: 73, pctAtReset: 118, resetMs: now + 7920000 },
   };
 }
 
-test("view-model：舞台三态文案映射——live 无徽标，held 显示保持，idle 显示空闲", () => {
+/** 造最小空快照（刚装/未配 provider 形态）：无流、无额度、无趋势、无结论 */
+function emptyV2Snapshot(now) {
+  return {
+    generatedAt: now,
+    rate: { state: "idle", streams: [], totalTps: 0, subTps: 0, lastEventAt: 0, lastProviderId: null, lastFinal: null, fallback: null },
+    quota: [],
+    trend: [],
+    conclusion: null,
+  };
+}
+
+test("素条四态逐字：live 单流/并行合计/空闲水位/待机（≤40 字符全数断言）", () => {
   const now = 1732252927000;
-  const live = toDisplayModel(makeSnapshot(now), now);
-  assert.equal(live.stage.state, "live");
-  assert.equal(live.stage.valueText, "428.6");
-  assert.equal(live.stage.badgeText, null, "live 态不显示保持/空闲徽标");
-  assert.equal(live.stage.main, "312.4");
-  assert.equal(live.stage.subagent, "116.2");
 
-  // held：改快照再跑映射（映射函数无状态，输入即快照）
-  const heldSnap = makeSnapshot(now);
-  heldSnap.rate.display = { value: 300, state: "held", asOf: now - 60000 };
-  const dm = toDisplayModel(heldSnap, now);
-  assert.match(dm.stage.badgeText, /^保持上次速度/, "held 徽标文案");
-  assert.equal(dm.stage.valueText, "300");
+  // 态① 生成中·仅主代理：速率合计 + 焦点厂商首窗口水位（设计 §五.6 逐字）
+  const live = toDisplayModelV2(makeV2Snapshot(now), now);
+  assert.equal(live.strip.text, "428 tok/s · 5h 73%");
+  assert.ok(live.strip.text.length <= 40, "素条文本超 40 字符（插槽契约）");
 
-  // idle 且无历史值：不显示 0，给空闲徽标
-  const idleSnap = makeSnapshot(now);
-  idleSnap.rate.display = { value: 0, state: "idle", asOf: now - 400000 };
-  const di = toDisplayModel(idleSnap, now);
-  assert.match(di.stage.badgeText, /空闲/);
-  assert.equal(di.stage.valueText, "—");
+  // 态② 生成中·主+子并行：合计形态「主+子」（素条取合计不并列各流）
+  const parallel = makeV2Snapshot(now);
+  parallel.rate.streams.push({ requestId: "req-2", modelId: "kimi-k2", providerId: "opencode-go", isSub: true, tps: 96, phase: "streaming" });
+  parallel.rate.totalTps = 524;
+  parallel.rate.subTps = 96;
+  const dm2 = toDisplayModelV2(parallel, now);
+  assert.equal(dm2.strip.text, "428+96 tok/s · 5h 73%");
+  assert.ok(dm2.strip.text.length <= 40);
+  // 速率数字口径：fmt1 一位小数去尾零（428.6→428.6、300→300）
+  parallel.rate.streams[0].tps = 428.6;
+  parallel.rate.totalTps = 524.6;
+  assert.equal(toDisplayModelV2(parallel, now).strip.text, "428.6+96 tok/s · 5h 73%");
+  const whole = makeV2Snapshot(now);
+  whole.rate.streams[0].tps = 300;
+  whole.rate.totalTps = 300;
+  assert.equal(toDisplayModelV2(whole, now).strip.text, "300 tok/s · 5h 73%");
+  // 焦点厂商无额度数据：生成中素条只给速率，不编造水位
+  const noQuota = makeV2Snapshot(now);
+  noQuota.quota = [];
+  assert.equal(toDisplayModelV2(noQuota, now).strip.text, "428 tok/s");
+
+  // 态③ 空闲：跟随最近请求厂商（quota.name 优先），首两个百分比窗口拼水位
+  const idle = makeV2Snapshot(now);
+  idle.rate = {
+    state: "idle",
+    streams: [],
+    totalTps: 0,
+    subTps: 0,
+    lastEventAt: now - 400000,
+    lastProviderId: "bigmodel-api",
+    lastFinal: { modelId: "glm-4.7", tps: 300, outputTokens: 1234, at: now - 400000 },
+    fallback: null,
+  };
+  const dm3 = toDisplayModelV2(idle, now);
+  assert.equal(dm3.strip.text, "智谱 5h 73% · 周 41%");
+  assert.ok(dm3.strip.text.length <= 40);
+  // 厂商名缺省回退 providerId（不显示空名）
+  const anon = makeV2Snapshot(now);
+  anon.rate = { ...idle.rate };
+  delete anon.quota[0].name;
+  assert.equal(toDisplayModelV2(anon, now).strip.text, "bigmodel-api 5h 73% · 周 41%");
+  // recent（final 后 ≤5 分钟）非生成中，素条同走空闲水位文案
+  const recent = makeV2Snapshot(now);
+  recent.rate = {
+    ...idle.rate,
+    state: "recent",
+    lastEventAt: now - 45000,
+    lastFinal: { modelId: "glm-4.7", tps: 300, outputTokens: 1234, at: now - 45000 },
+  };
+  assert.equal(toDisplayModelV2(recent, now).strip.text, "智谱 5h 73% · 周 41%");
+
+  // 面板速率条（同夹具顺带断言）：live 各流并列 + 主子标注 + 合计
+  assert.equal(dm2.panel.rate.stateText, "生成中");
+  assert.equal(dm2.panel.rate.streams[0].modelId, "glm-4.7");
+  assert.equal(dm2.panel.rate.streams[0].tpsText, "428");
+  assert.equal(dm2.panel.rate.streams[0].isSubText, null);
+  assert.equal(dm2.panel.rate.streams[1].modelId, "kimi-k2");
+  assert.equal(dm2.panel.rate.streams[1].tpsText, "96");
+  assert.equal(dm2.panel.rate.streams[1].isSubText, "子代理");
+  assert.equal(dm2.panel.rate.totalText, "524 tok/s");
+  // recent 面板：刚完成 + 末次值 + 完成于 Xs 前
+  const dmR = toDisplayModelV2(recent, now);
+  assert.equal(dmR.panel.rate.stateText, "刚完成");
+  assert.equal(dmR.panel.rate.totalText, "300 tok/s");
+  assert.equal(dmR.panel.rate.lastActivityText, "完成于 45s 前");
+  // 空闲面板：不显示过期速率，只给活动时刻
+  assert.equal(dm3.panel.rate.stateText, "空闲");
+  assert.equal(dm3.panel.rate.totalText, null);
+  assert.match(dm3.panel.rate.lastActivityText, /^上次活动 \d{2}:\d{2}$/);
+  // 兜底链：订阅不可达时面板速率条直给最近完成行，素条仍走水位文案
+  const fb = makeV2Snapshot(now);
+  fb.rate = { ...idle.rate, fallback: { tps: 108.2, completedAt: now - 60000 } };
+  const dmF = toDisplayModelV2(fb, now);
+  assert.equal(dmF.strip.text, "智谱 5h 73% · 周 41%");
+  assert.equal(dmF.panel.rate.totalText, "108.2 tok/s");
+  assert.match(dmF.panel.rate.lastActivityText, /^上次活动 \d{2}:\d{2}$/);
+  // 趋势区：24 点序号坐标 + 累计 foot
+  assert.equal(live.panel.trend.points.length, 24);
+  assert.deepEqual(live.panel.trend.points[0], { x: 0, y: 0 });
+  assert.deepEqual(live.panel.trend.points[21], { x: 21, y: 8.2e6 });
+  assert.equal(live.panel.trend.footText, "近 24 小时 · 累计 8.2M token");
+
+  // 态④ 无数据（刚装/未配 provider）：待机固定文案
+  const none = toDisplayModelV2(emptyV2Snapshot(now), now);
+  assert.equal(none.strip.text, "ZPowerPack 待机");
+  assert.ok(none.strip.text.length <= 40);
 });
 
-test("view-model：额度水位行——60/85 双信号转色、重置文案相对/绝对两态、来源标注", () => {
+test("素条 tooltip ≤200：三窗口+重置+主子速率全量且不截断关键信息", () => {
   const now = 1732252927000;
-  const dm = toDisplayModel(makeSnapshot(now), now);
-  assert.equal(dm.quota.rows.length, 3);
 
-  const zhipu = dm.quota.rows[0];
-  assert.equal(zhipu.name, "智谱 GLM Coding");
-  assert.equal(zhipu.srcLabel, "官方余量");
-  // 45% 已用 → 安全区（青）；重置 <48h → 相对时长文案
-  assert.equal(zhipu.windows[0].pct, 45);
-  assert.equal(zhipu.windows[0].barColor, "#6ee7ff");
-  assert.match(zhipu.windows[0].footText, /后重置/);
-  // 周窗口重置 3 天后 → 绝对日期文案
-  assert.match(zhipu.windows[1].footText, /重置$/);
+  // ① 生成中·仅主代理：厂商全窗口 + 首窗口重置说明 + 主速率（设计 §五.6 逐字）
+  const live = toDisplayModelV2(makeV2Snapshot(now), now);
+  assert.equal(live.strip.tooltip, "智谱 5h 73%（2h12m 后重置）· 周 41% · 主 428 tok/s · 点击查看详情");
+  assert.ok(live.strip.tooltip.length <= 200, "tooltip 超 200 字符（插槽契约）");
 
-  // 62% 已用 → 琥珀警示；86% 已用 → 珊瑚紧张（阈值双信号）
-  const kimi = dm.quota.rows[1];
-  assert.equal(kimi.windows[0].barColor, "#ffcf7a");
-  const oc = dm.quota.rows[2];
-  assert.equal(oc.windows[0].barColor, "#ff8f6b");
-  assert.match(oc.windows[0].footText, /紧张/);
-  // monthly 无重置时间（订阅日未知）→ 文案不给假时间
-  assert.equal(kimi.windows[1].footText, "订阅日重置");
+  // ② 主+子并行：主子速率分别全量 + 并行路数；重置说明不因并行省略
+  const parallel = makeV2Snapshot(now);
+  parallel.rate.streams.push({ requestId: "req-2", modelId: "kimi-k2", providerId: "opencode-go", isSub: true, tps: 96, phase: "streaming" });
+  parallel.rate.totalTps = 524;
+  parallel.rate.subTps = 96;
+  const dm2 = toDisplayModelV2(parallel, now);
+  assert.ok(dm2.strip.tooltip.includes("智谱 5h 73%（2h12m 后重置）· 周 41%"), "额度头须含重置说明");
+  assert.ok(dm2.strip.tooltip.includes("主 428 · 子 96 tok/s（2 路并行）"), "主子速率全量");
+  assert.ok(dm2.strip.tooltip.endsWith("点击查看详情"));
+  assert.ok(dm2.strip.tooltip.length <= 200);
+
+  // ③ 空闲：同①去掉速率段（水位全窗口 + 重置说明保留）
+  const idle = makeV2Snapshot(now);
+  idle.rate = { state: "idle", streams: [], totalTps: 0, subTps: 0, lastEventAt: now - 400000, lastProviderId: "bigmodel-api", lastFinal: null, fallback: null };
+  const dm3 = toDisplayModelV2(idle, now);
+  assert.equal(dm3.strip.tooltip, "智谱 5h 73%（2h12m 后重置）· 周 41% · 点击查看详情");
+
+  // 三窗口实例（OpenCode）：tooltip 枚举全部窗口，月窗口不截断
+  const oc = makeV2Snapshot(now);
+  oc.rate.lastProviderId = "opencode-go";
+  const dmO = toDisplayModelV2(oc, now);
+  assert.ok(dmO.strip.tooltip.includes("OpenCode 5h 86%（6h00m 后重置）· 周 57% · 月 28%"));
+  assert.ok(dmO.strip.tooltip.length <= 200);
+
+  // ④ 无数据：固定引导文案
+  assert.equal(toDisplayModelV2(emptyV2Snapshot(now), now).strip.tooltip, "ZPowerPack 用量速览 · 点击打开看板");
 });
 
-test("view-model：界面文案禁 P50/P95 术语——速度行取典型/最慢，首字等待 foot 取多数/最慢", () => {
+test("厂商行：环色 60/85 双阈值；状态句相对/绝对两态；percents 枚举全部窗口（OpenCode 三枚）", () => {
   const now = 1732252927000;
-  const dm = toDisplayModel(makeSnapshot(now), now);
-  const out = JSON.stringify(dm);
+  const dm = toDisplayModelV2(makeV2Snapshot(now), now);
+  const vendors = dm.panel.vendors;
+  assert.equal(vendors.length, 3);
+
+  // 排序：5h 水位降序（最紧张的排最上）
+  assert.deepEqual(vendors.map((v) => v.name), ["OpenCode", "智谱", "Kimi"]);
+
+  // 环色双阈值（已用口径）：86 ≥85 珊瑚、73 ≥60 琥珀、12 <60 青
+  assert.equal(vendors[0].ringPct, 86);
+  assert.equal(vendors[0].ringColor, "#ff8f6b");
+  assert.equal(vendors[1].ringPct, 73);
+  assert.equal(vendors[1].ringColor, "#ffcf7a");
+  assert.equal(vendors[2].ringPct, 12);
+  assert.equal(vendors[2].ringColor, "#6ee7ff");
+
+  // 状态句相对态：<48h 给「NhNmm 后重置」；≥85 紧张态加注
+  assert.equal(vendors[1].statusText, "5h · 2h12m 后重置");
+  assert.equal(vendors[0].statusText, "5h · 6h00m 后重置 · 余量紧张");
+  // 状态句绝对态：>48h 给「MM-DD HH:mm 重置」（不编造相对时长）
+  assert.match(vendors[2].statusText, /^5h · \d{2}-\d{2} \d{2}:\d{2} 重置$/);
+
+  // 副行：官方 resetsAt → 剩余时长（设计「剩 2d 4h」口径）；仅 percent → 已用标注；多窗口并列
+  assert.equal(vendors[1].subText, "周 · 剩 2d 4h");
+  assert.equal(vendors[0].subText, "周 · 剩 1d 6h · 月 · 剩 20d 0h");
+  assert.equal(vendors[2].subText, "月 · 已用 27%");
+
+  // percents 枚举实例全部窗口（OpenCode 三枚全量）
+  assert.deepEqual(vendors[0].percents, [
+    { label: "5h", pct: 86 },
+    { label: "周", pct: 57 },
+    { label: "月", pct: 28 },
+  ]);
+  assert.deepEqual(vendors[1].percents, [
+    { label: "5h", pct: 73 },
+    { label: "周", pct: 41 },
+  ]);
+});
+
+test("结论句：外推文本含实例名与「推算」标注；样本不足占位", () => {
+  const now = 1732252927000;
+  // 撑不到：外推水位 >100%（设计 §五.1 逐字）
+  const dm = toDisplayModelV2(makeV2Snapshot(now), now);
+  assert.equal(dm.panel.conclusion.text, "按近半小时速度，智谱 5h 撑不到重置（推算）");
+  // 撑得到：外推水位 ≤100%
+  const ok = makeV2Snapshot(now);
+  ok.conclusion = { instanceName: "智谱", pctNow: 73, pctAtReset: 96, resetMs: now + 7920000 };
+  assert.equal(toDisplayModelV2(ok, now).panel.conclusion.text, "按近半小时速度，智谱 5h 撑得到重置（推算）");
+  // 样本不足（Task 4 返回 null）：占位不编造
+  const thin = makeV2Snapshot(now);
+  thin.conclusion = null;
+  assert.equal(toDisplayModelV2(thin, now).panel.conclusion.text, "消耗速度尚不足以推算");
+});
+
+test("空快照全链不抛错：素条=待机、面板各空态", () => {
+  const now = 1732252927000;
+  const dm = toDisplayModelV2(emptyV2Snapshot(now), now);
+  assert.equal(dm.strip.text, "ZPowerPack 待机");
+  assert.equal(dm.strip.tooltip, "ZPowerPack 用量速览 · 点击打开看板");
+  // 速率条空态：无流、无末值、无兜底、无活动时刻
+  assert.equal(dm.panel.rate.stateText, "空闲");
+  assert.deepEqual(dm.panel.rate.streams, []);
+  assert.equal(dm.panel.rate.totalText, null);
+  assert.equal(dm.panel.rate.lastActivityText, null);
+  // 厂商行/趋势/结论空态
+  assert.deepEqual(dm.panel.vendors, []);
+  assert.deepEqual(dm.panel.trend.points, []);
+  assert.equal(dm.panel.trend.footText, "近 24 小时 · 暂无消耗");
+  assert.equal(dm.panel.conclusion.text, "消耗速度尚不足以推算");
+});
+
+test("界面文案禁 P50/P95（沿用护栏）", () => {
+  const now = 1732252927000;
+  const out = JSON.stringify(toDisplayModelV2(makeV2Snapshot(now), now));
   assert.ok(!/P50|P95/.test(out), "展示模型不得出现 P50/P95 字样（术语映射在 view-model 完成）");
-  // 速度对比行：亮段=典型，白刻度=最慢
-  const row = dm.grid.speed.rows[0];
-  assert.equal(row.valueText, "108/165");
-  assert.ok(row.widthPct > 0 && row.markerLeft > row.widthPct, "白刻度在亮段右侧（最慢>典型）");
-  // 首字等待 foot：多数/最慢用人话（最慢取全模型最大 TTFT）
-  assert.match(dm.grid.ttft.foot, /多数[^\d]*1[–-]2\s*秒/);
-  assert.match(dm.grid.ttft.foot, /最慢约\s*6\.1\s*秒/);
-});
-
-test("view-model：首字等待直方图——桶计数归一化为高度百分比，空数据给空态", () => {
-  const now = 1732252927000;
-  const dm = toDisplayModel(makeSnapshot(now), now);
-  assert.equal(dm.grid.ttft.hist.length, 10);
-  assert.equal(Math.max(...dm.grid.ttft.hist), 100, "最高桶=100%");
-
-  const empty = makeSnapshot(now);
-  empty.charts.ttftHist = [];
-  const de = toDisplayModel(empty, now);
-  assert.equal(de.grid.ttft.hasData, false);
-  assert.equal(de.grid.ttft.hist.length, 0);
-});
-
-test("view-model：上下文→速率卡——散点归一 + 趋势降幅 foot（诚实计算）", () => {
-  const now = 1732252927000;
-  const dm = toDisplayModel(makeSnapshot(now), now);
-  assert.ok(dm.grid.ctx.hasData);
-  assert.equal(dm.grid.ctx.dots.length, 3);
-  assert.match(dm.grid.ctx.foot, /降\s*1[0-9]%/, "首末对比降幅文案（150→123 ≈ 18%）");
-});
-
-test("view-model：时段热力——7×24 聚合为 24 小时列，分级 h0-h3，foot 给峰值时段与累计", () => {
-  const now = 1732252927000;
-  const dm = toDisplayModel(makeSnapshot(now), now);
-  assert.equal(dm.grid.heat.cells.length, 24);
-  assert.equal(dm.grid.heat.cells[21].level, "h3", "峰值小时达到最高档");
-  assert.match(dm.grid.heat.foot, /21:00–21:59/);
-  assert.match(dm.grid.heat.foot, /2\.0M/);
-});
-
-test("view-model：按项目与厂商稳定性卡——行排序/比例条/失败率行，缺数空态", () => {
-  const now = 1732252927000;
-  const dm = toDisplayModel(makeSnapshot(now), now);
-  assert.equal(dm.grid.projects.rows[0].label, "ZPowerPack");
-  assert.equal(dm.grid.projects.rows[0].valueText, "18.2M");
-  assert.equal(dm.grid.health.rows[0].label, "bigmodel-api");
-  assert.equal(dm.grid.health.rows[0].valueText, "0.4%");
-  assert.match(dm.grid.health.rows[0].hover, /重试率\s*2(\.0)?%/);
-
-  const empty = makeSnapshot(now);
-  empty.charts.byProject = [];
-  empty.charts.providerHealth = [];
-  const de = toDisplayModel(empty, now);
-  assert.equal(de.grid.projects.hasData, false);
-  assert.equal(de.grid.health.hasData, false);
-});
-
-test("view-model：视图内 dock 与迷你条——跟随最近请求厂商，text≤40，live 发 dot 徽标", () => {
-  const now = 1732252927000;
-  const dm = toDisplayModel(makeSnapshot(now), now);
-  // 迷你条（composer.status 承载）：文本≤40 且含速率与当前厂商窗口
-  assert.ok(dm.mini.text.length <= 40, `迷你条文本超长: ${dm.mini.text}`);
-  assert.match(dm.mini.text, /428\.6/);
-  assert.match(dm.mini.text, /45%/);
-  assert.equal(dm.mini.badge, "dot", "live 态发 dot 活动徽标");
-  assert.ok(dm.mini.tooltip.length <= 200, "tooltip≤200");
-  assert.ok(dm.mini.tooltip.includes("智谱 GLM Coding"), "tooltip 给厂商全名与窗口明细");
-  // 视图内 dock 同源：厂商名 + 速率 + 该厂商窗口
-  assert.equal(dm.dock.providerName, "智谱 GLM Coding");
-  assert.equal(dm.dock.windows.length, 2);
-
-  // 无请求数据：不显示 0 速率，给待机文案且不发徽标
-  const idle = makeSnapshot(now);
-  idle.rate.display = { value: 0, state: "idle", asOf: 0 };
-  idle.rate.lastProviderId = null;
-  const di = toDisplayModel(idle, now);
-  assert.match(di.mini.text, /待机/);
-  assert.equal(di.mini.badge, null);
-});
-
-test("view-model：空快照全链不抛错且各卡空态标注", () => {
-  const now = 1732252927000;
-  const empty = toDisplayModel(
-    { generatedAt: now, rate: { main: {}, subagent: {}, windowed: {}, byModel: [], display: { value: 0, state: "idle", asOf: 0 }, lastProviderId: null }, quota: [], charts: { throughput: [], latency: [], ttftHist: [], ctxVsRate: [], byProject: [], toolStats: [], providerHealth: [], heatmap: Array.from({ length: 7 }, () => Array(24).fill(0)) } },
-    now,
-  );
-  assert.equal(empty.quota.rows.length, 0);
-  assert.equal(empty.quota.emptyText, "未发现 provider 配置，额度卡待配置后可用");
-  assert.equal(empty.grid.speed.hasData, false);
-  assert.equal(empty.stage.valueText, "—");
+  // 空快照同受护栏约束
+  assert.ok(!/P50|P95/.test(JSON.stringify(toDisplayModelV2(emptyV2Snapshot(now), now))));
 });
 
 // ---------------------------------------------------------------------------
