@@ -4,7 +4,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 
 const ROOT = new URL("..", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
-const SKIP_DIRS = new Set(["node_modules", ".git", ".recon", ".impeccable", "原型", ".zcode-plugin"]);
+const SKIP_DIRS = new Set(["node_modules", ".git", ".recon", ".impeccable", ".superpowers", "原型", ".zcode-plugin"]);
 const EXTS = new Set([".mjs", ".js", ".json", ".md", ".html", ".css", ".ps1"]);
 
 const problems = [];
