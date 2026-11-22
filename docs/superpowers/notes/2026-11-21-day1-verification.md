@@ -112,7 +112,22 @@ function Zh(){ return env覆写 ?? join(Ae(), "credentials.json") }
 - 探针覆盖：manifest 混装校验、onAvailable 即时激活、nav.primary slot 渲染、views.register(entry+onDidOpen)、slots.update、ctx API 面、node:sqlite 导入、db 只读聚合、视图 window.zcode 探测、fetch 相对资源
 - 实测结果：待回填
 
-## 六、V6 额度接口调研表（回填区）
+## 六、V6 额度接口调研表（2026-11-22 调研完成回填）
 
-- Qwen：按用户 2026-11-21 拍板**移出额度查询范围**（官方接口放弃，规则表不含 Qwen），不再调研分母接口
-- 智谱 / Kimi / OpenCode：调研进行中，完成后回填端点/鉴权/响应字段/窗口重置边界/证据等级
+> 证据等级：A1=官方文档原文｜A2=官方客户端/官方 CLI 源码｜B=官方接口实测样例｜C=社区开源工具源码。完整报告与 Sources 见会话记录；此处为实现决策所需的最小集合。Qwen 按用户 2026-11-21 拍板**移出额度查询范围**（不调研、规则表不含）。
+
+| 厂商 | 端点 | 鉴权 | 响应要点 | 窗口与重置 | 证据 |
+|---|---|---|---|---|---|
+| 智谱 BigModel 站 | `GET https://open.bigmodel.cn/api/monitor/usage/quota/limit` | `Authorization: <apiKey>`（**无 Bearer**；团队套餐加 `?type=2` + `Bigmodel-Organization/Project` 头） | `data.limits[]`：`type`/`unit`/`usage`/`remaining`/`percentage`/`nextResetTime`；`data.level` 档位。取数：5h=`TOKENS_LIMIT&unit===3&number===5`，周=`TOKENS_LIMIT&unit===6`；月度 MCP 额度=`TIME_LIMIT&unit===5`（非套餐积分，不展示） | 5h=滚动（官方文档"动态刷新"）；**周=订阅日起 7 天周期，非固定周一**；重置卡会即时改变重置时间——`nextResetTime`（毫秒）为唯一权威 | A2（zcode 自带 `BigModelUsageQuotaProvider`，asar 验证）+ C |
+| 智谱 Z.ai 站 | `GET https://api.z.ai/api/monitor/usage/quota/limit` | `Authorization: Bearer <token>`（官方客户端对 zai family 加 Bearer） | 同上 | 同上 | A2 |
+| Kimi For Coding | `GET https://api.kimi.com/coding/v1/usages`（国际站 `api.kimi.ai`） | `Authorization: Bearer <sk-kimi-…>` + `Accept: application/json` | 新代际 `usages` map：`limit_5h`/`limit_7d`(老套餐)/`limit_month_code`/`limit_month_total`，各 `{used_ratio 0~1, reset_time ISO}`；旧代际 `usage{limit,used,resetTime}` + `limits[{window{duration,timeUnit}, detail{limit,used/remaining,resetTime}}]`；**计数全是字符串** | 5h=滚动；月=`limit_month_code`；官方已取消新会员周限制（老套餐多返回 `limit_7d`，忽略即可）；重置时间接口返回 | A2（官方 kimi-code CLI zod schema）+ B |
+| OpenCode Go/Zen | `GET https://opencode.ai/zen/go/v1/usage` | `Authorization: Bearer <apiKey 或 OAuth>`（社区实测纯 API Key 可不带 org 头） | `usage.rolling/weekly/monthly` 各 `{status:"ok"\|"rate-limited", percent, resetsAt}`；**只有百分比无绝对分母**；403=workspace 未订阅 Go | rolling=5h、weekly=周、monthly=月——与锁定三窗口逐一对应；`resetsAt` 接口返回 | A2（官方 opencode `usage-limits.ts`）+ C |
+
+### 对 Plan 2 实现的修正性影响（覆盖计划中的日历对齐假设）
+
+1. **重置时间一律取接口返回**（`nextResetTime`/`reset_time`/`resetsAt`），**不做本地推算**：智谱周窗口是订阅日锚定的 7 天周期（且重置卡会即时改变它）、Kimi 月窗口疑似订阅日锚定、OpenCode 未文档化——计划 Task 5 的"weekly=本周一 00:00 本地/monthly=dom 对齐"假设被调研推翻。
+2. **窗口规则表（window-rules.json）初值定稿**：智谱=`rolling-5h + weekly`（source: official-api）；Kimi=`rolling-5h + monthly`（official-api）；OpenCode=`rolling-5h + weekly + monthly`（official-api）；Qwen 不含。**windowBounds 仅作分子聚合的本地近似与 API 不可达时的兜底**：5h=[now-5h,now]；周兜底=[now-7d,now]（trailing 7 天，界面注明"以官方重置时间为准"）；月兜底=[now-30d,now]。
+3. **分母口径**：智谱给绝对值+百分比；Kimi 新代际与 OpenCode 只给百分比/比率 → **Kimi/OpenCode 绝对分母未证实 → 用户配置兜底**（界面直接展示官方百分比 + 用户配置的绝对限额）。
+4. **解析层防御点**：Kimi 两代际响应并存（先读 `usages` map，缺字段回退 `usage/limits`，计数为字符串）；OpenCode 403/404 = "未订阅/端点不可用"走兜底；智谱团队套餐 `?type=2`+组织头（个人套餐不发送）。
+5. Task 6 `fetchLimit` 路由表按上表端点/鉴权实现；`nextResetMs` 一并取回供额度卡展示重置时间。
+
