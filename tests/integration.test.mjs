@@ -191,6 +191,29 @@ test("集成：真实 schema db + provider 夹具 → activate 全链 → 快照
   const cmd = calls.commands.find((c) => c.id === "zpowerpack-open-dashboard");
   assert.ok(cmd, "素条命令已注册");
 
+  // ---- ⑨ 临时探测段（Task 0 采集，T6 移除）：真实 activate 链路内产出诊断文件 ----
+  // 本测试不注入 deps → 探测段真实执行：ctx 枚举/候选订阅/session 采样在真实 schema 下跑通
+  // 即激活正确性的证明；opts.deps 注入的单元测试路径已跳过探测段（防真机诊断文件污染）。
+  const diagPath = join(tmp, "cli", "zpowerpack", "v2-probe-diagnostics.json");
+  const diagText = readFileSync(diagPath, "utf8");
+  const diag = JSON.parse(diagText);
+  for (const key of ["ctxApi", "modelsSubscribe", "generateEvents", "viewOpenInfo", "sessionParentSample", "errors"]) {
+    assert.ok(key in diag, `诊断缺少 ${key} 段`);
+  }
+  assert.ok(diag.ctxApi.views && diag.ctxApi.commands && diag.ctxApi.slots, "ctx 键枚举覆盖 mock ctx 全部命名空间");
+  assert.ok(
+    Array.isArray(diag.modelsSubscribe.candidates) && diag.modelsSubscribe.candidates.length > 0,
+    "候选形态有探测记录（本 ctx 无 models 命名空间 → 应有 skip 记录而非空）",
+  );
+  assert.deepEqual(diag.errors, [], "真实 activate 全链探测零异常");
+  // session 采样：复用 realDeps 已开的只读连接（探测段不新开连接），
+  // 采到子代理归属对照数据；本夹具无归档列 → 降级为全表倒序查询，不得冒错
+  assert.equal(diag.sessionParentSample.ok, true, "session 采样成功（复用 realDeps 连接）");
+  const childRow = diag.sessionParentSample.rows.find((r) => r.id === "sess-child");
+  assert.ok(childRow && childRow.parent_id === "sess-root", "子代理会话 parent_id 已采到（归属对照数据）");
+  // 采集段不触碰 provider 文档 → 诊断无密钥
+  assert.ok(!diagText.includes("apiKey"), "诊断文件不得出现 apiKey 字样");
+
   // 清理：Windows 下 sqlite 只读句柄释放有延迟，rm 失败容忍（临时目录由 OS 回收）
   try {
     rmSync(tmp, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });

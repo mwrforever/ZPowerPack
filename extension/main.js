@@ -456,7 +456,8 @@ export async function computeQuota(providerDoc, now, buckets, log) {
 /** 真实数据源绑定（扩展宿主内运行；路径解析与迁移向导共用 config.mjs 规则） */
 function realDeps(log) {
   const homedir = os.homedir();
-  const opened = openDb(resolveDbPath(process.env, homedir));
+  // 经共享单例打开（临时：Task 0 采集段与本函数共用同一只读连接，避免重复 openDb；T6 随采集段还原为直接 openDb）
+  const opened = sharedOpenDb(homedir);
   if (!opened.db) log("[看板] 未找到官方遥测库（db.sqlite），看板将显示空态");
   // provider 文档读入内存一次，apiKey 仅在额度请求头内即时引用，绝不进入快照/日志
   const providerDoc = readProviderDoc(resolveProviderConfigPath(process.env, homedir));
@@ -536,7 +537,11 @@ export async function activate(ctx, opts = {}) {
     ctx.views.register("zpowerpack-dashboard", {
       // entry 相对插件根解析（V1 探针 ENOENT 实证教训）
       entry: "extension/view/index.html",
-      onDidOpen: () => log("[看板] 视图已打开"),
+      // info=宿主打开视图时传入的句柄（临时：Task 0 采集段消费键集与 notify 形态，T6 移除后仅保留日志）
+      onDidOpen: (info) => {
+        log("[看板] 视图已打开");
+        recordProbeViewOpen(info);
+      },
       resources: {
         // 展示模型：视图取数资源（V2 素条/面板文案映射已在 view-model 完成）
         "zpowerpack://display": {
@@ -566,5 +571,357 @@ export async function activate(ctx, opts = {}) {
   // 测试注入 deps 时不落默认快照文件（防真机副作用）；生产无 opts 时写默认路径
   const snapshotPath = opts.snapshotPath ?? (opts.deps ? undefined : defaultSnapshotPath());
   const handle = start({ intervalMs: opts.intervalMs, snapshotPath, deps: opts.deps, deliver, log });
+
+  // ---- 临时：Task 0 采集段（T6 移除）----
+  // 探针插件已卸载：订阅形态探测并入本次激活，供用户一次重启后采集定案；
+  // 独立 try/catch——任何探测失败绝不影响上方已完成的服务行为（全同步快速操作，10 秒激活预算内）。
+  // opts.deps 注入（单元测试）时跳过：mock ctx 无探测价值，且防真机诊断文件污染。
+  if (!opts.deps) {
+    try {
+      runProbeCollection(ctx, log);
+    } catch (e) {
+      log(`[ZPowerPack] Task 0 采集段失败（不影响服务，${e?.name || "异常"}）：${e?.message ?? ""}`);
+    }
+  }
   return handle;
+}
+
+/* ============================================================================
+ * 临时：Task 0 采集段（T6 移除）——探针插件已卸载后的替代采集路径。
+ *
+ * 职责：候选订阅形态逐一 try/catch 探测（models.onDidGenerate 函数直挂/.subscribe 对象双猜、
+ * models.subscribe 通用入口、ctx 顶层 subscribe 双签名、ctx 键含 subscribe/capabilities/protocol
+ * 兜底枚举、sessions.onDidChange* 对照），绑定成功后前 20 条生成事件累积（含相邻间隔毫秒），
+ * onDidOpen 入参键集与 notify 形态，session 表最近 3 活跃会话 parent_id 采样。
+ * 诊断原子写 <cliStorageRoot>/zpowerpack/v2-probe-diagnostics.json（tmp+rename 防撕裂）。
+ * 本段只读 ctx 与只读 db，不注册宿主资源、不推送素条；任何失败入 errors 不外抛。
+ * 宿主为单线程事件循环且单次激活，模块级容器无并发与重入风险。
+ * ========================================================================== */
+
+/** 生成事件累积上限：流式期事件高频到达，超出即丢弃，防诊断文件无限膨胀 */
+const PROBE_EVENT_LIMIT = 20;
+
+/** 最近一次生成事件的毫秒时刻：相邻间隔毫秒的原始数据（节流常数定案依据） */
+let probeLastEventAt = null;
+
+/** 诊断容器（模块级）：runProbeCollection 建立，事件/onDidOpen 回调持续填充；null=采集未启用（记录函数判空直跳） */
+let probeDiag = null;
+
+/** 只读 db 打开结果单例：realDeps 与采集段共用同一连接，采集段不重复 openDb（T6 随采集段还原为 realDeps 局部调用） */
+let probeSharedDb = null;
+function sharedOpenDb(homedir) {
+  if (probeSharedDb === null) probeSharedDb = openDb(resolveDbPath(process.env, homedir));
+  return probeSharedDb;
+}
+
+/** 诊断文件位置：<cliStorageRoot>/zpowerpack/v2-probe-diagnostics.json（与快照文件同目录） */
+function probeDiagPath() {
+  return join(resolveCliStorageRoot(process.env, os.homedir()), "zpowerpack", "v2-probe-diagnostics.json");
+}
+
+/** 诊断原子写盘（tmp+rename，读到半写状态不可能）；失败入 errors 不抛（诊断通道不干扰服务） */
+function flushProbeDiag() {
+  try {
+    mkdirSync(dirname(probeDiagPath()), { recursive: true });
+    const tmp = probeDiagPath() + ".tmp";
+    writeFileSync(tmp, JSON.stringify(probeDiag, null, 2), "utf8");
+    renameSync(tmp, probeDiagPath());
+  } catch (e) {
+    probeDiag?.errors?.push("诊断写盘失败: " + (e?.message ?? String(e)));
+  }
+}
+
+/**
+ * 生成事件记录（候选绑定成功后由宿主回调）：前 20 条含相邻间隔毫秒与载荷键集，逐条即写盘
+ * （流式期宿主若中途退出，已采事件不丢失）；达到上限直接丢弃。
+ * @param {...*} args 宿主回调实参（直挂形态为 (payload)；通用 subscribe 通道可能为
+ *                  (topic, payload)，实参类型序可区分载荷位置）
+ */
+function recordProbeEvent(...args) {
+  if (!probeDiag || probeDiag.generateEvents.length >= PROBE_EVENT_LIMIT) return;
+  const now = Date.now();
+  // 首条无前驱间隔记 null；后续记录与上一条的毫秒差（事件到达节奏的原始数据）
+  const intervalMs = probeLastEventAt === null ? null : now - probeLastEventAt;
+  probeLastEventAt = now;
+  const ev = args[0];
+  let keys = null;
+  let payload = null;
+  try {
+    keys = Object.keys(ev ?? {});
+    // 序列化钉死载荷键名与取值形态（函数类字段会丢，对键名定案无影响）
+    payload = JSON.parse(JSON.stringify(ev ?? null));
+  } catch (e) {
+    payload = "事件序列化失败: " + (e?.message ?? String(e));
+  }
+  probeDiag.generateEvents.push({
+    at: new Date().toISOString(),
+    intervalMs,
+    argTypes: args.slice(0, 3).map((a) => (a === null ? "null" : typeof a)),
+    keys,
+    payload,
+  });
+  // 首个事件到达时刷新 session 采样：触发生成的会话可能激活后才创建，保证归属对照覆盖
+  if (probeDiag.generateEvents.length === 1) {
+    probeDiag.sessionParentSample = probeSessionParentSample(sharedOpenDb(os.homedir()).db);
+  }
+  flushProbeDiag();
+}
+
+/**
+ * 对照组事件记录（ctx.sessions.onDidChange* 绑定）：只记首条键集与载荷。
+ * 目的：models 候选全败而对照组有事件 → 问题出在挂载/授权而非订阅机制本身；
+ * 只记一条，避免会话变更高频刷爆诊断文件。
+ * @param {object} ev 宿主推送的会话变更事件载荷
+ */
+function recordProbeControlEvent(ev) {
+  if (!probeDiag || probeDiag.modelsSubscribe.controlFirstEvent) return;
+  let keys = null;
+  let payload = null;
+  try {
+    keys = Object.keys(ev ?? {});
+    payload = JSON.parse(JSON.stringify(ev ?? null));
+  } catch (e) {
+    payload = "序列化失败: " + (e?.message ?? String(e));
+  }
+  probeDiag.modelsSubscribe.controlFirstEvent = { at: new Date().toISOString(), keys, payload };
+  flushProbeDiag();
+}
+
+/**
+ * 单个候选形态的绑定尝试：任何异常都归入该候选的失败记录，不影响其余候选探测。
+ * @param {string} form 形态标签（与 SUBSCRIBE_FORM 定案一一对应，如 "ctx.models.onDidGenerate()"）
+ * @param {Function} bind 执行绑定的闭包（内部调用宿主 API），返回宿主给出的句柄
+ * @returns {{ok: boolean, handle?: unknown}} ok=true 表示绑定调用未抛异常（句柄可能是任意形态）
+ */
+function probeTryBind(form, bind) {
+  try {
+    const handle = bind();
+    probeDiag.modelsSubscribe.candidates.push({
+      form,
+      result: "bound",
+      // 句柄形态是定案依据：函数句柄还是带 dispose/unsubscribe 的对象句柄
+      handleType: handle === null ? "null" : typeof handle,
+      handleKeys: handle && typeof handle === "object" ? Object.keys(handle) : null,
+    });
+    return { ok: true, handle };
+  } catch (e) {
+    probeDiag.modelsSubscribe.candidates.push({ form, result: "error: " + (e?.message ?? String(e)) });
+    return { ok: false };
+  }
+}
+
+/**
+ * 候选订阅形态逐一探测：宿主声明表含 models.onDidGenerate（kind:"subscribe"）但扩展 ctx 的
+ * 挂载形态未知，按可能性从高到低尝试；任一形态绑定成功即停，避免同一事件被重复订阅
+ * 导致事件双计、间隔失真。
+ * @param {object} ctx 扩展上下文（宿主 activate 入参，可能不含 models 命名空间）
+ */
+function probeSubscribeCandidates(ctx) {
+  const models = ctx?.models;
+  let generateBound = false;
+
+  // 候选 1/2：ctx.models.onDidGenerate——函数（调用即订阅）或带 subscribe 方法的对象（Rx 风格），二者互斥
+  if (typeof models?.onDidGenerate === "function") {
+    const r = probeTryBind("ctx.models.onDidGenerate()", () => models.onDidGenerate(recordProbeEvent));
+    if (r.ok) {
+      generateBound = true;
+      probeDiag.modelsSubscribe.activeForm = "ctx.models.onDidGenerate()";
+    }
+  } else if (models?.onDidGenerate && typeof models.onDidGenerate.subscribe === "function") {
+    const r = probeTryBind("ctx.models.onDidGenerate.subscribe()", () => models.onDidGenerate.subscribe(recordProbeEvent));
+    if (r.ok) {
+      generateBound = true;
+      probeDiag.modelsSubscribe.activeForm = "ctx.models.onDidGenerate.subscribe()";
+    }
+  } else {
+    // 两种直挂形态都不存在：记录实际类型与 models 键集，作为 fallback 形态的判读证据
+    probeDiag.modelsSubscribe.candidates.push({
+      form: "ctx.models.onDidGenerate",
+      result: "skip",
+      actualType: models?.onDidGenerate === undefined ? "undefined" : typeof models.onDidGenerate,
+      modelsKeys: models ? Object.keys(models) : null,
+    });
+  }
+
+  // 候选 3：models 命名空间上的通用 subscribe 入口（backend:"pump" 的统一通道可能形态）
+  if (typeof models?.subscribe === "function") {
+    if (!generateBound) {
+      const r = probeTryBind('ctx.models.subscribe("onDidGenerate", cb)', () => models.subscribe("onDidGenerate", recordProbeEvent));
+      if (r.ok) {
+        generateBound = true;
+        probeDiag.modelsSubscribe.activeForm = 'ctx.models.subscribe("onDidGenerate", cb)';
+      }
+    } else {
+      probeDiag.modelsSubscribe.candidates.push({
+        form: "ctx.models.subscribe",
+        result: "skip: 已由 " + probeDiag.modelsSubscribe.activeForm + " 绑定，避免事件双计",
+      });
+    }
+  } else {
+    probeDiag.modelsSubscribe.candidates.push({
+      form: "ctx.models.subscribe",
+      result: "skip",
+      actualType: models?.subscribe === undefined ? "undefined" : typeof models.subscribe,
+    });
+  }
+
+  // 候选 4：ctx 顶层通用 subscribe（宿主存在通用订阅机制但扩展侧挂载签名未知）；
+  // 仅在前面形态全败时按「事件全名/短名」两种猜测尝试，成功一种即停
+  if (!generateBound && typeof ctx?.subscribe === "function") {
+    const r1 = probeTryBind('ctx.subscribe("models.onDidGenerate", cb)', () => ctx.subscribe("models.onDidGenerate", recordProbeEvent));
+    if (r1.ok) {
+      generateBound = true;
+      probeDiag.modelsSubscribe.activeForm = 'ctx.subscribe("models.onDidGenerate", cb)';
+    } else {
+      const r2 = probeTryBind('ctx.subscribe("onDidGenerate", cb)', () => ctx.subscribe("onDidGenerate", recordProbeEvent));
+      if (r2.ok) {
+        generateBound = true;
+        probeDiag.modelsSubscribe.activeForm = 'ctx.subscribe("onDidGenerate", cb)';
+      }
+    }
+  }
+
+  // 兜底枚举：ctx 顶层任何含 subscribe/capabilities/protocol 的入口只做形态记录不绑定，
+  // 为下一轮探测或 fallback 定案提供挂载证据
+  try {
+    for (const key of Object.keys(ctx ?? {})) {
+      if (/subscribe|capabilities|protocol/i.test(key)) {
+        const v = ctx[key];
+        probeDiag.modelsSubscribe.candidates.push({
+          form: "ctx." + key,
+          result: "inspect-only",
+          type: typeof v,
+          objectKeys: v && typeof v === "object" ? Object.keys(v) : null,
+        });
+      }
+    }
+  } catch (e) {
+    probeDiag.errors.push("ctx 顶层 subscribe/capabilities/protocol 枚举失败: " + (e?.message ?? String(e)));
+  }
+
+  // 对照组：ctx.sessions 的 onDid* / subscribe* 入口——验证订阅回调通道在本宿主的可触发性
+  try {
+    const sessions = ctx?.sessions;
+    const sessionEventKeys = sessions
+      ? Object.keys(sessions).filter((k) => (/^onDid/.test(k) || /^subscribe/.test(k)) && typeof sessions[k] === "function")
+      : [];
+    probeDiag.modelsSubscribe.control = { sessionEventKeys, controlForm: null, controlHandleType: null };
+    if (sessionEventKeys.length > 0) {
+      // 取第一个事件键作对照绑定：其事件与生成事件无关，仅验证回调通道可被宿主触发
+      const key = sessionEventKeys[0];
+      const r = probeTryBind("ctx.sessions." + key + "()", () => sessions[key](recordProbeControlEvent));
+      if (r.ok) {
+        probeDiag.modelsSubscribe.control.controlForm = "ctx.sessions." + key + "()";
+        probeDiag.modelsSubscribe.control.controlHandleType = r.handle === null ? "null" : typeof r.handle;
+      }
+    }
+  } catch (e) {
+    probeDiag.modelsSubscribe.control = { error: e?.message ?? String(e) };
+  }
+}
+
+/**
+ * session 表采样：最近活跃 3 个会话的 id/parent_id（事件 sessionId 主/子代理归属判读的对照数据）。
+ * 列按 PRAGMA table_info 探测选用（兼容宿主 schema 演进与测试夹具：归档/时间列缺失时降级查询，
+ * 缺表/查询失败返回 ok=false，由调用方入诊断 errors，不抛出）。
+ * @param {DatabaseSync|null} db realDeps 已开的只读连接（采集段不新开连接）
+ * @returns {{ok: boolean, rows?: object[], error?: string|null, sampledAt: string}}
+ *          ok=true 时 rows 为 snake_case 原始行（id/parent_id/time_updated）；
+ *          ok=false 时无 rows，error 为失败原因
+ */
+function probeSessionParentSample(db) {
+  const base = { sampledAt: new Date().toISOString() };
+  if (!db) return { ...base, ok: false, error: "遥测库不可用（realDeps 未开出只读连接）" };
+  try {
+    const cols = db.prepare("PRAGMA table_info(session)").all().map((c) => c.name);
+    if (!cols.includes("id")) return { ...base, ok: false, error: "session 表不存在或无 id 列" };
+    const selectCols = ["id", "parent_id", "time_updated"].filter((c) => cols.includes(c));
+    // 活跃过滤：归档/删除列存在才加（真实库有而部分 schema 没有——缺列降级为全表倒序，不冒错）
+    const where = ["time_archived", "time_deleted"].filter((c) => cols.includes(c)).map((c) => `"${c}" IS NULL`);
+    const order = cols.includes("time_updated") ? ' ORDER BY "time_updated" DESC' : "";
+    const sql =
+      `SELECT ${selectCols.map((c) => `"${c}"`).join(", ")} FROM session` +
+      (where.length > 0 ? " WHERE " + where.join(" AND ") : "") +
+      order +
+      " LIMIT 3";
+    return { ...base, ok: true, rows: db.prepare(sql).all(), error: null };
+  } catch (e) {
+    return { ...base, ok: false, error: e?.message ?? String(e) };
+  }
+}
+
+/**
+ * onDidOpen 入参记录（T4 视图钩子的临时采集接线）：句柄键集与 notify 形态。
+ * JSON.stringify 会丢函数字段，notify 须单独 typeof 记录才能钉死句柄形态；
+ * 采集未启用（probeDiag=null，单元测试注入 deps 路径）时判空直跳，不产生任何副作用。
+ * @param {object|null} info 宿主打开视图时传入的句柄信息（键集与 notify 形态的采集对象）
+ */
+function recordProbeViewOpen(info) {
+  if (!probeDiag) return;
+  try {
+    probeDiag.viewOpenInfo = {
+      at: new Date().toISOString(),
+      keys: info ? Object.keys(info) : null,
+      notifyType: typeof info?.notify,
+      payload: JSON.parse(JSON.stringify(info ?? null)),
+    };
+    flushProbeDiag();
+  } catch (e) {
+    probeDiag.errors.push("onDidOpen 记录失败: " + (e?.message ?? String(e)));
+  }
+}
+
+/**
+ * 采集段主入口（activate 末尾调用；opts.deps 注入的单元测试路径已在外层跳过）：
+ * 建诊断容器 → ctx 键枚举 → 候选订阅逐一绑定 → session 采样 → 首次写盘。
+ * 后续生成事件/onDidOpen/对照组事件到达由各记录函数增量写盘；
+ * 任何单项失败入 errors 不外抛，整体失败由 activate 外层 try/catch 兜住。
+ * @param {object} ctx 扩展上下文（宿主 activate 入参）
+ * @param {Function} log 日志（仅整体完成打一行中文提示，不打印载荷细节）
+ */
+function runProbeCollection(ctx, log) {
+  probeDiag = {
+    capturedAt: new Date().toISOString(),
+    note: "临时：Task 0 采集（T6 移除）——探针插件已卸载，宿主一次重启内采集订阅形态定案",
+    // ctx API 面：键名 + 每键值类型/对象键集（正式实现的宿主 API 使用依据）
+    ctxApi: null,
+    // 订阅候选结论：candidates=每形态绑定结果（bound/skip/error + 句柄类型），activeForm=首个绑定成功形态
+    modelsSubscribe: { candidates: [], activeForm: null, control: null, controlFirstEvent: null },
+    // 生成事件累积：≤20 条含相邻间隔毫秒（事件节奏与载荷键名的原始数据）
+    generateEvents: [],
+    // onDidOpen 句柄记录：视图首次打开时由 recordProbeViewOpen 填充
+    viewOpenInfo: null,
+    // session 采样：最近 3 活跃会话 id/parent_id（事件归属对照）
+    sessionParentSample: null,
+    errors: [],
+  };
+
+  // ① ctx 键枚举：键名 + 值类型（函数/对象键集/原始类型）
+  try {
+    probeDiag.ctxApi = {};
+    for (const key of Object.keys(ctx ?? {})) {
+      const v = ctx[key];
+      probeDiag.ctxApi[key] =
+        typeof v === "function" ? "function" : v && typeof v === "object" ? { objectKeys: Object.keys(v) } : typeof v;
+    }
+  } catch (e) {
+    probeDiag.errors.push("ctx 枚举失败: " + (e?.message ?? String(e)));
+  }
+
+  // ② 候选订阅逐一探测（绑定成功者的事件由 recordProbeEvent 累积）
+  try {
+    probeSubscribeCandidates(ctx);
+  } catch (e) {
+    probeDiag.errors.push("订阅候选探测整体失败: " + (e?.message ?? String(e)));
+  }
+
+  // ③ session 采样（复用 realDeps 已开的只读连接；查询失败入诊断不抛）
+  try {
+    probeDiag.sessionParentSample = probeSessionParentSample(sharedOpenDb(os.homedir()).db);
+  } catch (e) {
+    probeDiag.sessionParentSample = { ok: false, error: e?.message ?? String(e) };
+  }
+
+  flushProbeDiag();
+  log("[ZPowerPack] Task 0 采集段完成，诊断已写盘（临时，T6 移除）");
 }

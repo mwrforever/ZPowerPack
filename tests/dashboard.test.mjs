@@ -416,6 +416,8 @@ test("activate：注册看板视图（entry 相对插件根）+ display/snapshot
     // 无事件无额度 → 素条空态（V2 展示模型形状）
     assert.equal(parsed.strip.text, "ZPowerPack 待机");
     assert.ok(def.resources["zpowerpack://snapshot"], "保留原始快照资源（调试通道）");
+    // onDidOpen 消费宿主句柄入参不抛（临时：Task 0 采集段的记录函数在注入 deps 路径判空直跳）
+    assert.doesNotThrow(() => def.onDidOpen({ view: {}, notify: () => {} }));
   } finally {
     stop();
   }
