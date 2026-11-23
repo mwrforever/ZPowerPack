@@ -176,6 +176,7 @@ function setNum(node, text) {
 /** 区一 · 速率条：圆点=活跃流在飞；头行=合计/末值（单流并入模型名）；次行=多流并列；三行=活动时刻 */
 var lastStreamsHtml = "";
 function renderRate(rate) {
+  rate = rate || {}; // 段缺失防御：display 载荷异常时退化为空态，不得抛错卡住整屏
   var streams = Array.isArray(rate.streams) ? rate.streams : [];
   el("rate-dot").style.display = streams.length > 0 ? "" : "none";
   setNum(el("rate-state"), rate.stateText === null || rate.stateText === undefined ? "" : rate.stateText);
@@ -235,6 +236,7 @@ function renderVendors(vendors) {
 
 /** 区三 · 24h 趋势：view-model 24 点（x=序号、y=token 数）→ 内联 SVG 面积折线坐标换算 */
 function renderTrend(trend) {
+  trend = trend || {}; // 段缺失防御：display 载荷异常时退化为空折线，不得抛错
   var pts = Array.isArray(trend.points) ? trend.points : [];
   var line = el("trend-line");
   var fill = el("trend-fill");
@@ -258,13 +260,13 @@ function renderTrend(trend) {
   setNum(el("trend-foot"), trend.footText === null || trend.footText === undefined ? "" : trend.footText);
 }
 
-/** 渲染入口：速率条文本级常刷（数字逐秒可变）；厂商行/趋势按 JSON 差异重建，降低 DOM 抖动 */
+/** 渲染入口：速率条文本级常刷（数字逐秒可变）；厂商行/趋势按 JSON 差异重建，降低 DOM 抖动。
+ *  遮罩只在全部区渲染成功后隐藏（渲染抛错时首帧遮罩保留，由 refresh 回写失败文案）。 */
 var booted = false;
 var lastVendorsJson = "";
 var lastTrendJson = "";
 function render(dm) {
   if (!dm || !dm.panel) return;
-  if (!booted) { booted = true; el("boot").classList.add("hide"); }
   renderRate(dm.panel.rate);
   var vj = JSON.stringify(dm.panel.vendors);
   if (vj !== lastVendorsJson) { lastVendorsJson = vj; renderVendors(dm.panel.vendors); }
@@ -272,6 +274,8 @@ function render(dm) {
   if (tj !== lastTrendJson) { lastTrendJson = tj; renderTrend(dm.panel.trend); }
   var c = dm.panel.conclusion;
   setNum(el("conclusion-line"), c && typeof c.text === "string" ? c.text : "");
+  // 全部区渲染完成才撤首帧遮罩（此前任何异常都不会错误隐藏连接提示）
+  if (!booted) { booted = true; el("boot").classList.add("hide"); }
 }
 
 /**
@@ -338,13 +342,22 @@ function trySubscribe() {
 }
 
 /** 数据刷新入口（订阅回调/轮询/同步成功共用）：读 display → 差异渲染。
+ *  在飞护栏：1s 轮询与订阅/同步可能同刻触发，前一次未落地时直接跳过，避免读请求叠加。
  *  失败不伪装成空数据：首帧前更新遮罩提示，首帧后静默重试（画面保持最后真值不假动）。 */
+var inFlight = false;
 function refresh() {
+  if (inFlight) return;
+  inFlight = true;
   readDisplay().then(function (dm) {
-    render(dm);
+    try {
+      render(dm);
+    } catch (e) {
+      // 渲染异常（载荷形状漂移）：首帧遮罩不得错误隐藏，回写可读的失败文案
+      if (!booted) el("boot").textContent = "数据渲染失败…（" + (e && e.message ? e.message : "未知错误") + "）";
+    }
   }, function (e) {
     if (!booted) el("boot").textContent = "数据通道连接中…（" + (e && e.message ? e.message : "未知错误") + "）";
-  });
+  }).finally(function () { inFlight = false; });
 }
 
 trySubscribe();

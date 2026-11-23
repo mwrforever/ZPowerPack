@@ -220,7 +220,8 @@ test("集成：真实 schema db + provider 夹具 → activate 全链 → 快照
   assert.equal(display.panel.rate.totalText, "428 tok/s");
   assert.equal(display.panel.vendors.length, 3, "三家厂商行全出");
   // ---- ⑤b 视图消费契约（Task 7 视图全量重写后的哑渲染绑定面）：display 载荷 V2 形状全链 ----
-  // 顶层/四区键序固定：视图差异渲染按段比对，多键即破坏哑绑定契约
+  // 顶层/四区键集按契约钉死（deepEqual 收紧到「多键/缺键即断」；视图实际按 vendors/trend
+  // 的 JSON 差异重渲，不依赖键序——此断言是扩展侧载荷契约的守门，不代表视图依赖顺序）
   assert.deepEqual(Object.keys(display), ["strip", "panel"], "display 顶层只含 strip/panel");
   assert.deepEqual(Object.keys(display.panel), ["rate", "vendors", "trend", "conclusion"], "panel 四区键齐");
   // 速率条绑定字段：各流并列三键（modelId/tpsText/isSubText 可空），活动时刻可空
@@ -234,14 +235,18 @@ test("集成：真实 schema db + provider 夹具 → activate 全链 → 快照
     display.panel.rate.lastActivityText === null || typeof display.panel.rate.lastActivityText === "string",
     "活动时刻可空或字符串",
   );
-  // 厂商行绑定字段：环百分比可空、环色 hex、状态句必有（低水位/紧张态文案已在 view-model 定稿）、副行可空
+  // 厂商行绑定字段：环百分比可空、环色 hex、状态句可空或字符串、副行可空
   for (const v of display.panel.vendors) {
     assert.ok(v.ringPct === null || typeof v.ringPct === "number", "ringPct 可空或数值");
     assert.match(v.ringColor, /^#[0-9a-f]{6}$/i, "环色为 hex 色值（stroke-dasharray 环直渲）");
-    assert.equal(typeof v.statusText, "string", "状态句必有");
+    assert.ok(v.statusText === null || typeof v.statusText === "string", "状态句可空或字符串（无窗口实例为 null）");
     assert.ok(v.subText === null || typeof v.subText === "string", "副行可空或字符串");
+    // 百分比枚举必须覆盖实例全部窗口（OpenCode 三枚真钉住，少一枚即视图丢窗口）
+    const quotaRow = snap.quota.find((q) => q.name === v.name);
+    assert.ok(quotaRow, `厂商行应对应快照额度实例: ${v.name}`);
+    assert.equal(v.percents.length, quotaRow.windows.length, `百分比枚举须覆盖全部窗口: ${v.name}`);
     assert.ok(
-      Array.isArray(v.percents) && v.percents.every((p) => typeof p.label === "string" && (p.pct === null || typeof p.pct === "number")),
+      v.percents.every((p) => typeof p.label === "string" && (p.pct === null || typeof p.pct === "number")),
       "百分比枚举字段齐（OpenCode 三枚全量契约）",
     );
   }
@@ -268,7 +273,7 @@ test("集成：真实 schema db + provider 夹具 → activate 全链 → 快照
   const cmd = calls.commands.find((c) => c.id === "zpowerpack-open-dashboard");
   assert.ok(cmd, "素条命令已注册");
 
-  // ---- ⑨ 临时探测段（Task 0 采集，T6 移除）：真实 activate 链路内产出诊断文件 ----
+  // ---- ⑨ 临时探测段（Task 0 采集，保留至 T9 采集后移除）：真实 activate 链路内产出诊断文件 ----
   // 本测试不注入 deps → 探测段真实执行：ctx 枚举/候选订阅/session 采样在真实 schema 下跑通
   // 即激活正确性的证明；opts.deps 注入的单元测试路径已跳过探测段（防真机诊断文件污染）。
   const diagPath = join(tmp, "cli", "zpowerpack", "v2-probe-diagnostics.json");
@@ -307,5 +312,69 @@ test("集成：真实 schema db + provider 夹具 → activate 全链 → 快照
     rmSync(tmp, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
   } catch {
     // 句柄未释放时留待 OS 清理
+  }
+});
+
+test("集成：空库空配置 → activate 不抛错、display 空态、素条待机", async () => {
+  // 真实 schema 但零行数据：首拍回填零行、空窗守卫游标兜底、额度过无 provider 分支
+  const tmp = mkdtempSync(join(tmpdir(), "zp-integ-empty-"));
+  const dbPath = join(tmp, "db.sqlite");
+  const db = new DatabaseSync(dbPath);
+  db.exec(`CREATE TABLE model_usage (${MU_COLS})`);
+  db.exec(
+    `CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, path TEXT, title TEXT, project_id TEXT,
+     parent_id TEXT, time_created INTEGER, time_updated INTEGER)`,
+  );
+  db.close();
+
+  const envKeys = ["ZCODE_SESSION_DB_PATH", "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE", "ZCODE_STORAGE_DIR"];
+  const saved = envKeys.map((k) => process.env[k]);
+  process.env.ZCODE_SESSION_DB_PATH = dbPath;
+  // provider 配置路径指向不存在的文件：激活走「未找到 provider 配置」分支（额度卡空态）
+  process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = join(tmp, "provider_config.json");
+  process.env.ZCODE_STORAGE_DIR = join(tmp, "cli");
+
+  const calls = { views: [], commands: [], slots: [], opened: [] };
+  const ctx = {
+    views: { register: (id, def) => calls.views.push({ id, def }), open: (id) => calls.opened.push(id) },
+    commands: { register: (id, fn) => calls.commands.push({ id, fn }) },
+    slots: { update: (id, patch, scope) => calls.slots.push({ id, patch, scope }) },
+  };
+
+  let handle;
+  try {
+    handle = await activate(ctx, { intervalMs: 120, log: () => {} });
+    await new Promise((r) => setTimeout(r, 400)); // 3 拍以上：确认空库下拍频稳定不抛错
+
+    // display 空态：界面四区全部退化到诚实空态（不编造数据）
+    const display = JSON.parse(calls.views[0].def.resources["zpowerpack://display"].read({ view: {} }));
+    assert.equal(display.strip.text, "ZPowerPack 待机", "空库素条=待机");
+    assert.equal(display.panel.rate.stateText, "空闲", "空库速率条=空闲");
+    assert.deepEqual(display.panel.rate.streams, [], "空库无活跃流");
+    assert.deepEqual(display.panel.vendors, [], "无 provider 配置 → 无厂商行");
+    assert.equal(display.panel.trend.points.length, 24, "趋势固定 24 点（全零）");
+    assert.equal(display.panel.trend.footText, "近 24 小时 · 暂无消耗");
+    assert.equal(display.panel.conclusion.text, "消耗速度尚不足以推算");
+
+    // 素条：无 workbench/事件 → 全局待机推送可达
+    const slotCalls = calls.slots.filter((s) => s.id === "zpowerpack-mini");
+    assert.ok(slotCalls.length >= 1, "空库也应推送素条（待机）");
+    assert.equal(slotCalls[slotCalls.length - 1].patch.text, "ZPowerPack 待机");
+
+    // 快照文件兜底：五段契约仍在（空库不产出错误形状）
+    const snap = JSON.parse(readFileSync(join(tmp, "cli", "zpowerpack", "last-snapshot.json"), "utf8"));
+    assert.deepEqual(snap.quota, [], "空配置额度段为空数组");
+    assert.equal(snap.rate.state, "idle", "空库 rate 段为空闲");
+  } finally {
+    if (handle) handle.stop();
+    envKeys.forEach((k, i) => {
+      if (saved[i] === undefined) delete process.env[k];
+      else process.env[k] = saved[i];
+    });
+    try {
+      rmSync(tmp, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    } catch {
+      // 句柄未释放时留待 OS 清理
+    }
   }
 });

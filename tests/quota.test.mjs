@@ -10,7 +10,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { windowBounds, usageInWindow, percent } from "../extension/core/quota.mjs";
+import { windowBounds, percent } from "../extension/core/quota.mjs";
 import rules from "../extension/core/window-rules.json" with { type: "json" };
 
 const HOUR = 3600000;
@@ -65,21 +65,6 @@ test("windowBounds：monthly 无锚定 → trailing 30 天兜底；有锚定 →
   const b2 = windowBounds({ type: "monthly" }, now, { nextResetMs: anchor });
   assert.equal(b2.startMs, anchor - 30 * DAY, "月周期长按 30 天近似（界面注明以官方重置时间为准）");
   assert.equal(b2.endMs, anchor);
-});
-
-test("usageInWindow：按 providerId 与边界过滤，token 与请求数两个口径", () => {
-  const now = 1700000000000;
-  const bounds = { startMs: now - 5 * HOUR, endMs: now };
-  const rows = [
-    { providerId: "bigmodel-api", startedAt: now - HOUR, inputTokens: 100, outputTokens: 50, reasoningTokens: 5, status: "completed" },
-    { providerId: "bigmodel-api", startedAt: now - 2 * HOUR, inputTokens: 200, outputTokens: 80, reasoningTokens: 0, status: "error" },
-    { providerId: "kimi-code-cn", startedAt: now - HOUR, inputTokens: 999, outputTokens: 1, reasoningTokens: 0, status: "completed" },
-    { providerId: "bigmodel-api", startedAt: now - 6 * HOUR, inputTokens: 777, outputTokens: 7, reasoningTokens: 0, status: "completed" }, // 窗口外
-  ];
-  const u = usageInWindow(rows, { providerId: "bigmodel-api", bounds });
-  assert.equal(u.input, 300, "仅窗口内该实例的行");
-  assert.equal(u.output, 135, "output 计入 reasoning");
-  assert.equal(u.requests, 2, "error 行计入请求数");
 });
 
 test("percent：limit null/0 → null，否则保留 1 位", () => {

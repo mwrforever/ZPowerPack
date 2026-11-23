@@ -40,31 +40,6 @@ export function windowBounds(rule, now, anchors = {}) {
 }
 
 /**
- * 窗口内分子聚合：某 provider 实例在该边界内的 token 与请求数。
- * @param {object[]} rows db-reader 行数组
- * @param {{providerId: string, bounds: {startMs: number, endMs: number}}} opts
- * @returns {{input: number, output: number, requests: number}}
- *          input=Σinput_tokens；output=Σ(output+reasoning)（与速率分子口径一致）；
- *          requests=行数（含 error 行——错误请求同样消耗额度）
- */
-export function usageInWindow(rows, opts) {
-  const { providerId, bounds } = opts;
-  let input = 0;
-  let output = 0;
-  let requests = 0;
-  for (const row of rows) {
-    if (row.providerId !== providerId) continue;
-    // 分子按 started_at 计入（§五：请求发起时刻落窗口），缺失兜底 completed_at
-    const t = typeof row.startedAt === "number" ? row.startedAt : row.completedAt;
-    if (typeof t !== "number" || t < bounds.startMs || t > bounds.endMs) continue;
-    input += row.inputTokens ?? 0;
-    output += (row.outputTokens ?? 0) + (row.reasoningTokens ?? 0);
-    requests++;
-  }
-  return { input, output, requests };
-}
-
-/**
  * 百分比（保留 1 位）。
  * @param {number} used 已用量
  * @param {number|null} limit 限额（null/0 → 无法计算，返回 null；0 限额会除零且无业务意义）

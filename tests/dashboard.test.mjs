@@ -5,7 +5,7 @@
  * Task 7 视图形约（卡片面板单文件自包含：无外链/渲染锚点/动效降级/双通道取数——文案零断言，
  * 数据文案已由 view-model 用例钉死，视图只哑渲染）。
  *
- * 背景：V1 view-model 映射用例随 charts 退役删除（Task 5，映射本体待 Task 8 清零）；
+ * 背景：V1 view-model 映射用例随 charts 退役删除（Task 5）；映射本体已随 Task 8 死代码清零移除；
  * tick 60s 拍/节流/防重入用例属服务层契约，随 Task 4 落在 pipeline.test.mjs。宿主源码实证：
  * - engines.zcode 校验基准 = 扩展 API 版本 1.4.0（非应用版本）
  * - slots = plugin.json 顶层对象（slot id 做键），target 单键 {view|command: id}；
@@ -21,6 +21,7 @@ import assert from "node:assert/strict";
 import { readFileSync, existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import vm from "node:vm";
 
 import { activate, bindOnGenerate } from "../extension/main.js";
 import { toDisplayModelV2 } from "../extension/view-model.mjs";
@@ -352,6 +353,39 @@ test("会话作用域素条：focus 段只取该会话流与聚焦供应商额�
   assert.equal(toDisplayModelV2(base, now).strip.text, "928 tok/s · 5h 73%");
 });
 
+test("面板会话作用域：opts.sessionId 按 reqSession 归属过滤速率流并重算合计；其余区仍全局", () => {
+  const now = 1732252927000;
+  const base = makeV2Snapshot(now);
+  base.rate.streams.push({ requestId: "req-2", modelId: "kimi-k2", providerId: "kimi-code-cn", isSub: false, tps: 500, phase: "streaming" });
+  base.rate.totalTps = 928;
+  const reqSession = new Map([
+    ["req-1", "sA"],
+    ["req-2", "sB"],
+  ]);
+
+  // 指定会话只见本会话流；合计按过滤后的流重算（不得串入他会话数值）
+  const a = toDisplayModelV2(base, now, { sessionId: "sA", reqSession });
+  assert.deepEqual(a.panel.rate.streams.map((s) => s.modelId), ["glm-4.7"]);
+  assert.equal(a.panel.rate.totalText, "428 tok/s");
+  const b = toDisplayModelV2(base, now, { sessionId: "sB", reqSession });
+  assert.deepEqual(b.panel.rate.streams.map((s) => s.modelId), ["kimi-k2"]);
+  assert.equal(b.panel.rate.totalText, "500 tok/s");
+  // 该会话无活跃流 → 空流列表（不拿他会话速率充数）
+  assert.deepEqual(toDisplayModelV2(base, now, { sessionId: "sZ", reqSession }).panel.rate.streams, []);
+
+  // 缺省会话 → 全局口径（现行行为）；空对象同义
+  const global = toDisplayModelV2(base, now);
+  assert.equal(global.panel.rate.streams.length, 2);
+  assert.equal(global.panel.rate.totalText, "928 tok/s");
+  assert.equal(toDisplayModelV2(base, now, {}).panel.rate.streams.length, 2);
+
+  // 其余区（vendors/trend/conclusion）与素条不受会话过滤影响
+  assert.deepEqual(a.panel.vendors, global.panel.vendors);
+  assert.deepEqual(a.panel.trend, global.panel.trend);
+  assert.deepEqual(a.panel.conclusion, global.panel.conclusion);
+  assert.equal(a.strip.text, global.strip.text);
+});
+
 test("厂商行：环色 60/85 双阈值；状态句相对/绝对两态；percents 枚举全部窗口（OpenCode 三枚）", () => {
   const now = 1732252927000;
   const dm = toDisplayModelV2(makeV2Snapshot(now), now);
@@ -628,6 +662,70 @@ test("activate：onDidOpen 保存 notify 句柄，数据更新时 notify(display
   }
 });
 
+test("activate：display read 按会话作用域过滤面板速率（callInfo.scope 直取优先，视图实例映射兜底，缺省全局）", async () => {
+  const ctx = makeMockCtx();
+  const now = 1732252927000;
+  const deps = { ...fakeDeps(), now: () => now };
+  const handle = await activate(ctx, { intervalMs: 5, deps });
+  try {
+    await new Promise((r) => setTimeout(r, 40));
+    // 两会话各一路在飞流（事件间隔 ≥1s 以跨过事件型 deliver 节流）
+    handle.onGenerateEvent(
+      { sessionId: "sA", requestId: "rA", model: { providerId: "bigmodel-api", modelId: "glm-4.7" }, phase: "streaming", outputTokensPerSecond: 111 },
+      now + 1000,
+    );
+    handle.onGenerateEvent(
+      { sessionId: "sB", requestId: "rB", model: { providerId: "kimi-code-cn", modelId: "kimi-k2" }, phase: "streaming", outputTokensPerSecond: 222 },
+      now + 3000,
+    );
+    const read = ctx.calls.views[0].def.resources["zpowerpack://display"].read;
+
+    // ① 无调用方信息 → 全局口径（现行行为）
+    assert.equal(JSON.parse(read()).panel.rate.streams.length, 2);
+    // ② callInfo 直接携带 scope.sessionId → 优先级最高
+    const a = JSON.parse(read({ scope: { kind: "session", sessionId: "sA" } }));
+    assert.deepEqual(a.panel.rate.streams.map((s) => s.modelId), ["glm-4.7"]);
+    assert.equal(a.panel.rate.totalText, "111 tok/s");
+    // ③ onDidOpen 记录「视图实例 → 会话」，read 仅带视图标识也可解析
+    let closeCb = null;
+    ctx.calls.views[0].def.onDidOpen({
+      view: { id: "v-b" },
+      scope: { kind: "session", sessionId: "sB" },
+      notify: () => {},
+      onDidClose: (cb) => (closeCb = cb),
+    });
+    const b = JSON.parse(read({ view: { id: "v-b" } }));
+    assert.deepEqual(b.panel.rate.streams.map((s) => s.modelId), ["kimi-k2"]);
+    assert.equal(b.panel.rate.totalText, "222 tok/s");
+    // ④ 视图关闭清除归属映射 → 同标识读回归全局口径
+    closeCb();
+    assert.equal(JSON.parse(read({ view: { id: "v-b" } })).panel.rate.streams.length, 2);
+    // ⑤ 未知视图标识 / 非会话 scope → 全局口径（不猜会话归属）
+    assert.equal(JSON.parse(read({ view: { id: "v-unknown" } })).panel.rate.streams.length, 2);
+    assert.equal(JSON.parse(read({ scope: { kind: "workspace" } })).panel.rate.streams.length, 2);
+  } finally {
+    handle.stop();
+  }
+});
+
+test("activate：stop 统一退订宿主订阅——函数句柄与对象句柄各退订一次，重复 stop 幂等", async () => {
+  const ctx = makeMockCtx();
+  let generateDisposed = 0;
+  let workbenchDisposed = 0;
+  // 两种宿主句柄形态：onDidGenerate 返回函数；workbench.onDidChange 返回 {dispose}
+  ctx.models = { onDidGenerate: () => () => { generateDisposed++; } };
+  ctx.workbench = { onDidChange: () => ({ dispose: () => { workbenchDisposed++; } }) };
+  const handle = await activate(ctx, { intervalMs: 5, deps: fakeDeps() });
+  await new Promise((r) => setTimeout(r, 30));
+  handle.stop();
+  assert.equal(generateDisposed, 1, "onDidGenerate 函数句柄应在 stop 时调用");
+  assert.equal(workbenchDisposed, 1, "workbench 对象句柄 dispose 应在 stop 时调用");
+  // 重复 stop（宿主销毁与服务自身停用双路径）不得重复退订
+  handle.stop();
+  assert.equal(generateDisposed, 1, "重复 stop 不得重复退订");
+  assert.equal(workbenchDisposed, 1, "重复 stop 不得重复退订");
+});
+
 test("activate：素条按会话分别推送——workbench 可见会话各得本会话值，slots.update 第三参传 {sessionId}", async () => {
   const ctx = makeMockCtx();
   const now = 1732252927000;
@@ -816,7 +914,7 @@ function readView() {
   return readFileSync(new URL("../extension/view/index.html", import.meta.url), "utf8");
 }
 
-test("视图自包含：无外链 script、零外部 URL 引用；五渲染锚点 data-testid 齐", () => {
+test("视图自包含：无外链 script、零外部 URL 引用；五渲染锚点 data-testid 齐；内联脚本语法可编译", () => {
   const html = readView();
   // 宿主对 entry 形态视图只伺服 pageUri + 注册资源（V1 探针实证）：外链 script/字体必失败
   assert.ok(!/<script[^>]*\bsrc=/i.test(html), "不得存在外链 script（宿主不伺服外部脚本）");
@@ -825,6 +923,26 @@ test("视图自包含：无外链 script、零外部 URL 引用；五渲染锚�
   for (const tid of ["rate-bar", "vendor-row", "trend-chart", "sync-btn", "conclusion-line"]) {
     assert.ok(html.includes(`data-testid="${tid}"`), `缺少 data-testid="${tid}"`);
   }
+  // 内联脚本语法编译（node:vm）：语法错误不得在其它用例全绿下蒙混过关
+  const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/gi)].map((m) => m[1]);
+  assert.equal(scripts.length, 1, "视图只允许一段内联脚本（单文件自包含铁律）");
+  assert.doesNotThrow(() => new vm.Script(scripts[0]), "内联脚本必须通过语法编译");
+});
+
+test("视图健壮性：panel.rate/trend 缺失防御；render 抛错不提前隐藏遮罩；取数 inFlight 护栏", () => {
+  const html = readView();
+  // 段缺失防御：渲染函数入口把入参归一为空对象，缺失段退化为空态而非抛错
+  assert.match(html, /function renderRate\(rate\) \{\s*rate = rate \|\| \{\};/, "renderRate 未对 rate 缺失做防御");
+  assert.match(html, /function renderTrend\(trend\) \{\s*trend = trend \|\| \{\};/, "renderTrend 未对 trend 缺失做防御");
+  // 遮罩隐藏必须在全部渲染成功之后：脚本文本序上位于结论句绑定之后
+  const bootHideIdx = html.indexOf('el("boot").classList.add("hide")');
+  const conclusionIdx = html.indexOf('setNum(el("conclusion-line")');
+  assert.ok(conclusionIdx > 0 && bootHideIdx > conclusionIdx, "遮罩隐藏必须在结论句渲染之后（抛错时不得错误隐藏）");
+  // refresh 成功分支 try/catch：渲染异常不得吞掉首帧遮罩提示
+  assert.match(html, /readDisplay\(\)\.then\(function \(dm\) \{\s*try \{[\s\S]*?render\(dm\);[\s\S]*?\} catch/, "refresh 成功分支缺少渲染 try/catch");
+  // 取数 inFlight 护栏：1s 轮询 + 订阅 + sync 共用入口，在飞时跳过并 finally 复位
+  assert.match(html, /if \(inFlight\) return;/, "刷新入口缺少 inFlight 护栏");
+  assert.match(html, /\.finally\(function \(\) \{ inFlight = false; \}\)/, "inFlight 必须在 finally 复位");
 });
 
 test("动效契约：数字节点挂 300ms 过渡类；prefers-reduced-motion 全关；仅呼吸圆点与同步旋转两枚功能动画", () => {

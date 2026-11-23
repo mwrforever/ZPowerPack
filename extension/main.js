@@ -472,7 +472,7 @@ export async function computeQuota(providerDoc, now, buckets, log) {
 /** 真实数据源绑定（扩展宿主内运行；路径解析与迁移向导共用 config.mjs 规则） */
 function realDeps(log) {
   const homedir = os.homedir();
-  // 经共享单例打开（临时：Task 0 采集段与本函数共用同一只读连接，避免重复 openDb；T8 随采集段还原为直接 openDb）
+  // 经共享单例打开（临时：Task 0 采集段与本函数共用同一只读连接，避免重复 openDb；T9 采集后移除时还原为直接 openDb）
   const opened = sharedOpenDb(homedir);
   if (!opened.db) log("[看板] 未找到官方遥测库（db.sqlite），看板将显示空态");
   // provider 文档读入内存一次，apiKey 仅在额度请求头内即时引用，绝不进入快照/日志
@@ -510,6 +510,46 @@ const EMPTY_DISPLAY = toDisplayModelV2(
 );
 
 /**
+ * 宿主调用方信息里的会话作用域提取（面板会话作用域，修订 #1）：
+ * onDidOpen 句柄与资源 read 的 callInfo 形状尚未真机定案（T9 采集校准），
+ * 仅认 scope.kind==="session" 的明确信号，其次兼容顶层 sessionId。
+ * @param {object|null} source 宿主传入的句柄信息或 read 的 callInfo
+ * @returns {string|null} 会话 id；非会话作用域/缺失 → null（调用方走全局口径）
+ */
+function sessionIdOf(source) {
+  const scope = source?.scope;
+  if (scope?.kind === "session" && typeof scope.sessionId === "string") return scope.sessionId;
+  if (typeof source?.sessionId === "string") return source.sessionId;
+  return null;
+}
+
+/**
+ * 视图实例标识提取（「视图实例→会话」映射键）：宿主调用方信息形状未定案，
+ * 按 view.id → viewId → instanceId 顺序探测字符串标识。
+ * @param {object|null} source onDidOpen 句柄信息或 read 的 callInfo
+ * @returns {string|null} 实例标识；无可用标识 → null（该视图不参与会话映射）
+ */
+function viewKeyOf(source) {
+  if (typeof source?.view?.id === "string") return source.view.id;
+  if (typeof source?.viewId === "string") return source.viewId;
+  if (typeof source?.instanceId === "string") return source.instanceId;
+  return null;
+}
+
+/**
+ * 订阅句柄退订归一（stop 统一退订）：宿主订阅可能返回函数句柄或带 dispose/unsubscribe
+ * 方法的对象句柄；无法识别（undefined/null/其他）→ null（宿主销毁时自行回收，无需补偿）。
+ * @param {*} bound 宿主订阅调用返回值
+ * @returns {Function|null} 无参退订函数
+ */
+function toDisposer(bound) {
+  if (typeof bound === "function") return bound;
+  if (bound && typeof bound.dispose === "function") return () => bound.dispose();
+  if (bound && typeof bound.unsubscribe === "function") return () => bound.unsubscribe();
+  return null;
+}
+
+/**
  * 生成事件订阅绑定（Task 6 接线）：宿主 ctx 的订阅挂载形态未定案（Task 0 真机采集在途），
  * 按临时探测段的候选序列逐一尝试、先绑定成功者胜——同一事件重复订阅会双计速率，任一
  * 形态成功即停。序列与 probeSubscribeCandidates 一致：models.onDidGenerate 函数直挂 →
@@ -517,22 +557,31 @@ const EMPTY_DISPLAY = toDisplayModelV2(
  * @param {object} ctx 扩展上下文（宿主 activate 入参，可能不含 models 命名空间）
  * @param {Function} handler 事件处理函数（activate 的会话追踪包装后入口）
  * @param {Function} log 日志（中文；每个失败候选留痕，供真机诊断对照）
+ * @param {Function} onBound 绑定成功回调（收到宿主返回的订阅句柄，供 activate 在 stop 时退订）
  * @returns {string|null} 绑定成功的形态标签；null=全部候选失败（订阅不可达，速率由
  *          tickV2 兜底行接管，激活不失败——由调用方记中文 warn）
  */
-export function bindOnGenerate(ctx, handler, log = () => {}) {
+export function bindOnGenerate(ctx, handler, log = () => {}, onBound = () => {}) {
   const models = ctx?.models;
+  /** 句柄登记失败不得误判为绑定失败（否则会继续尝试下一候选造成事件双计） */
+  const notifyBound = (bound) => {
+    try {
+      onBound(bound);
+    } catch {
+      // 句柄登记失败不影响已成功的订阅本身
+    }
+  };
   // 候选 1/2：ctx.models.onDidGenerate——函数（调用即订阅）或带 subscribe 方法的对象（Rx 风格），二者互斥
   if (typeof models?.onDidGenerate === "function") {
     try {
-      models.onDidGenerate(handler);
+      notifyBound(models.onDidGenerate(handler));
       return "ctx.models.onDidGenerate()";
     } catch (e) {
       log(`[ZPowerPack] 订阅形态 ctx.models.onDidGenerate() 绑定失败：${e?.message ?? ""}`);
     }
   } else if (models?.onDidGenerate && typeof models.onDidGenerate.subscribe === "function") {
     try {
-      models.onDidGenerate.subscribe(handler);
+      notifyBound(models.onDidGenerate.subscribe(handler));
       return "ctx.models.onDidGenerate.subscribe()";
     } catch (e) {
       log(`[ZPowerPack] 订阅形态 ctx.models.onDidGenerate.subscribe() 绑定失败：${e?.message ?? ""}`);
@@ -541,7 +590,7 @@ export function bindOnGenerate(ctx, handler, log = () => {}) {
   // 候选 3：models 命名空间上的通用 subscribe 入口（backend:"pump" 的统一通道可能形态）
   if (typeof models?.subscribe === "function") {
     try {
-      models.subscribe("onDidGenerate", handler);
+      notifyBound(models.subscribe("onDidGenerate", handler));
       return 'ctx.models.subscribe("onDidGenerate", cb)';
     } catch (e) {
       log(`[ZPowerPack] 订阅形态 ctx.models.subscribe("onDidGenerate", cb) 绑定失败：${e?.message ?? ""}`);
@@ -550,13 +599,13 @@ export function bindOnGenerate(ctx, handler, log = () => {}) {
   // 候选 4：ctx 顶层通用 subscribe——事件全名优先、短名次之（挂载签名未知双猜）
   if (typeof ctx?.subscribe === "function") {
     try {
-      ctx.subscribe("models.onDidGenerate", handler);
+      notifyBound(ctx.subscribe("models.onDidGenerate", handler));
       return 'ctx.subscribe("models.onDidGenerate", cb)';
     } catch (e) {
       log(`[ZPowerPack] 订阅形态 ctx.subscribe("models.onDidGenerate", cb) 绑定失败：${e?.message ?? ""}`);
     }
     try {
-      ctx.subscribe("onDidGenerate", handler);
+      notifyBound(ctx.subscribe("onDidGenerate", handler));
       return 'ctx.subscribe("onDidGenerate", cb)';
     } catch (e) {
       log(`[ZPowerPack] 订阅形态 ctx.subscribe("onDidGenerate", cb) 绑定失败：${e?.message ?? ""}`);
@@ -593,6 +642,10 @@ export async function activate(ctx, opts = {}) {
   let latestDisplay = null;
   // 视图句柄缓存（推送链 §五.8）：onDidOpen 保存 {notify}，onDidClose 清引用防向已关闭视图推送
   let viewPort = null;
+  // 视图实例→会话归属（面板会话作用域，修订 #1）：read 的 callInfo 未直接带会话时的兜底映射
+  const viewScope = new Map();
+  // ctx 订阅退订句柄（stop 统一调用；宿主销毁时也安全——退订幂等由宿主保证，重复 stop 只跑一次）
+  const disposers = [];
   // 会话作用域状态（修订 #1）：requestId→sessionId 归属（素条流过滤依据）
   const reqSession = new Map();
   // sessionId→最近请求供应商（组合上下文为 null 时的 tooltip 回退，事件到达时刷新）
@@ -694,30 +747,52 @@ export async function activate(ctx, opts = {}) {
     scheduleStripPush();
   };
 
+  /**
+   * 展示模型按调用方会话取数（面板会话作用域，修订 #1）：callInfo 直接带会话优先，
+   * 否则用「视图实例→会话」映射兜底；无会话归属 → 全局口径快照（现行行为）。
+   * @param {object} [callInfo] 宿主资源 read 的调用方信息（形状未定案，T9 采集校准）
+   * @returns {object} 展示模型（{strip, panel}）
+   */
+  const displayFor = (callInfo) => {
+    if (latestSnapshot === null) return EMPTY_DISPLAY;
+    const direct = sessionIdOf(callInfo);
+    const viewKey = direct === null ? viewKeyOf(callInfo) : null;
+    const sessionId = direct ?? (viewKey === null ? null : (viewScope.get(viewKey) ?? null));
+    // 无会话归属走现成的全局缓存（避免每读一次重建）；会话口径按需过滤速率流
+    if (sessionId === null) return latestDisplay;
+    return toDisplayModelV2(latestSnapshot, Date.now(), { sessionId, reqSession });
+  };
+
   try {
     ctx.views.register("zpowerpack-dashboard", {
       // entry 相对插件根解析（V1 探针 ENOENT 实证教训）
       entry: "extension/view/index.html",
-      // info=宿主打开视图时传入的句柄（临时：Task 0 采集段消费键集与 notify 形态，T8 移除后仅保留日志）
+      // info=宿主打开视图时传入的句柄（临时：Task 0 采集段消费键集与 notify 形态；T9 采集后移除采集调用，仅保留日志）
       onDidOpen: (info) => {
         log("[看板] 视图已打开");
         recordProbeViewOpen(info);
         // 推送链（§五.8）：保存 notify 句柄，数据更新时通知视图重读 display
         viewPort = typeof info?.notify === "function" ? { notify: info.notify } : null;
+        // 面板会话作用域（修订 #1）：onDidOpen 的 scope 是「视图实例→会话」映射的唯一来源
+        const openSession = sessionIdOf(info);
+        const viewKey = viewKeyOf(info);
+        if (openSession !== null && viewKey !== null) viewScope.set(viewKey, openSession);
         try {
-          // 视图关闭由宿主回调：清引用，防向已关闭视图推送通知
+          // 视图关闭由宿主回调：清引用，防向已关闭视图推送通知与陈旧的会话归属
           info?.onDidClose?.(() => {
             viewPort = null;
+            if (viewKey !== null) viewScope.delete(viewKey);
           });
         } catch (e) {
           log(`[看板] 视图关闭回调注册失败（${e?.message ?? ""}）`);
         }
       },
       resources: {
-        // 展示模型：视图取数资源（V2 素条/面板文案映射已在 view-model 完成）
+        // 展示模型：视图取数资源（V2 素条/面板文案映射已在 view-model 完成）；
+        // read(callInfo) 携带调用方视图会话时，面板速率条按该会话过滤（修订 #1）
         "zpowerpack://display": {
           mimeType: "application/json",
-          read: () => JSON.stringify(latestDisplay ?? EMPTY_DISPLAY),
+          read: (callInfo) => JSON.stringify(displayFor(callInfo)),
         },
         // 原始快照：调试通道（无密钥）
         "zpowerpack://snapshot": {
@@ -757,11 +832,15 @@ export async function activate(ctx, opts = {}) {
   try {
     const wb = ctx?.workbench;
     if (typeof wb?.onDidChange === "function") {
-      wb.onDidChange(applyWorkbench);
+      const bound = wb.onDidChange(applyWorkbench);
+      const dispose = toDisposer(bound);
+      if (dispose) disposers.push(dispose);
       workbenchOk = true;
     } else if (typeof wb?.onDidChange?.subscribe === "function") {
       // Rx 风格对象挂载（与生成事件候选序列同思路的形态兼容）
-      wb.onDidChange.subscribe(applyWorkbench);
+      const bound = wb.onDidChange.subscribe(applyWorkbench);
+      const dispose = toDisposer(bound);
+      if (dispose) disposers.push(dispose);
       workbenchOk = true;
     }
     if (workbenchOk) {
@@ -802,11 +881,15 @@ export async function activate(ctx, opts = {}) {
   };
 
   // 订阅绑定（候选序列同临时探测段，先成功者胜）：全败 → 中文 warn，速率走 tickV2 兜底行（§五.5）
-  const activeForm = bindOnGenerate(ctx, onGenerateEvent, log);
+  // 绑定的句柄登记进 disposers，stop 时统一退订（宿主销毁服务时不留悬挂订阅）
+  const activeForm = bindOnGenerate(ctx, onGenerateEvent, log, (bound) => {
+    const dispose = toDisposer(bound);
+    if (dispose) disposers.push(dispose);
+  });
   if (activeForm !== null) log(`[ZPowerPack] 生成事件订阅已绑定（${activeForm}）`);
   else log("[ZPowerPack] 生成事件订阅不可达（候选形态全败），速率走落库兜底链");
 
-  // ---- 临时：Task 0 采集段（T8 移除）----
+  // ---- 临时：Task 0 采集段（T9 采集后移除）----
   // 探针插件已卸载：订阅形态探测并入本次激活，供 V2 首次真机部署同轮采集定案；
   // 独立 try/catch——任何探测失败绝不影响上方已完成的服务行为（全同步快速操作，10 秒激活预算内）。
   // opts.deps 注入（单元测试）时跳过：mock ctx 无探测价值，且防真机诊断文件污染。
@@ -817,12 +900,29 @@ export async function activate(ctx, opts = {}) {
       log(`[ZPowerPack] Task 0 采集段失败（不影响服务，${e?.name || "异常"}）：${e?.message ?? ""}`);
     }
   }
+  /**
+   * 停用入口（宿主守恒）：先停拍，再统一退订本激活登记的宿主订阅（句柄取走即清空，重复调用幂等），
+   * 最后清视图推送句柄与视图会话映射——宿主销毁服务后不得再向已关闭视图推送。
+   */
+  const stop = () => {
+    handle.stop();
+    for (const dispose of disposers.splice(0)) {
+      try {
+        dispose();
+      } catch (e) {
+        log(`[ZPowerPack] 退订失败（${e?.name || "异常"}）：${e?.message ?? ""}`);
+      }
+    }
+    viewPort = null;
+    viewScope.clear();
+  };
+
   // 返回包装后的事件入口（测试直驱可验证会话素条链路）；宿主不消费返回值
-  return { stop: handle.stop, onGenerateEvent };
+  return { stop, onGenerateEvent };
 }
 
 /* ============================================================================
- * 临时：Task 0 采集段（T8 移除）——探针插件已卸载后的替代采集路径。
+ * 临时：Task 0 采集段（T9 采集后移除）——探针插件已卸载后的替代采集路径。
  *
  * 职责：候选订阅形态逐一 try/catch 探测（models.onDidGenerate 函数直挂/.subscribe 对象双猜、
  * models.subscribe 通用入口、ctx 顶层 subscribe 双签名、ctx 键含 subscribe/capabilities/protocol
@@ -842,11 +942,16 @@ let probeLastEventAt = null;
 /** 诊断容器（模块级）：runProbeCollection 建立，事件/onDidOpen 回调持续填充；null=采集未启用（记录函数判空直跳） */
 let probeDiag = null;
 
-/** 只读 db 打开结果单例：realDeps 与采集段共用同一连接，采集段不重复 openDb（T8 随采集段还原为 realDeps 局部调用） */
-let probeSharedDb = null;
+/**
+ * 只读 db 打开结果单例（按库路径缓存）：realDeps 与采集段共用同一连接，采集段不重复 openDb
+ * （T9 采集后移除时还原为 realDeps 局部调用）。按路径而非全局唯一缓存：同一进程内测试
+ * 多轮激活会改道 env，全局唯一会让后一轮沿用前一轮的库连接（读到别的库的数据）。
+ */
+const probeSharedDbs = new Map();
 function sharedOpenDb(homedir) {
-  if (probeSharedDb === null) probeSharedDb = openDb(resolveDbPath(process.env, homedir));
-  return probeSharedDb;
+  const path = resolveDbPath(process.env, homedir);
+  if (!probeSharedDbs.has(path)) probeSharedDbs.set(path, openDb(path));
+  return probeSharedDbs.get(path);
 }
 
 /** 诊断文件位置：<cliStorageRoot>/zpowerpack/v2-probe-diagnostics.json（与快照文件同目录） */
@@ -1117,7 +1222,7 @@ function recordProbeViewOpen(info) {
 function runProbeCollection(ctx, log) {
   probeDiag = {
     capturedAt: new Date().toISOString(),
-    note: "临时：Task 0 采集（T8 移除）——探针插件已卸载，宿主一次重启内采集订阅形态定案",
+    note: "临时：Task 0 采集（T9 采集后移除）——探针插件已卸载，宿主一次重启内采集订阅形态定案",
     // ctx API 面：键名 + 每键值类型/对象键集（正式实现的宿主 API 使用依据）
     ctxApi: null,
     // 订阅候选结论：candidates=每形态绑定结果（bound/skip/error + 句柄类型），activeForm=首个绑定成功形态
@@ -1158,5 +1263,5 @@ function runProbeCollection(ctx, log) {
   }
 
   flushProbeDiag();
-  log("[ZPowerPack] Task 0 采集段完成，诊断已写盘（临时，T8 移除）");
+  log("[ZPowerPack] Task 0 采集段完成，诊断已写盘（临时，T9 采集后移除）");
 }

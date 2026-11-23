@@ -39,25 +39,6 @@ const camelOf = (c) => c.replace(/_([a-z])/g, (_, ch) => ch.toUpperCase());
 /** USED_COLS → camelCase 行字段映射（由 USED_COLS 推导，保证行输出与列集契约天然一致） */
 const USED_MAP = new Map(USED_COLS.map((c) => [c, camelOf(c)]));
 
-/** tool_usage 全量列 → camelCase 行字段映射（E1）。退役：Task 4 切换导入，Task 8 清零 */
-const TOOL_USAGE_MAP = {
-  id: "id",
-  session_id: "sessionId",
-  tool_name: "toolName",
-  side_effect_scope: "sideEffectScope",
-  read_only: "readOnly",
-  destructive: "destructive",
-  approval_status: "approvalStatus",
-  status: "status",
-  started_at: "startedAt",
-  first_output_at: "firstOutputAt",
-  completed_at: "completedAt",
-  duration_ms: "durationMs",
-  time_to_first_output_ms: "timeToFirstOutputMs",
-  exit_code: "exitCode",
-  output_bytes: "outputBytes",
-};
-
 /** session 表全量列 → camelCase 行字段映射（E1：按项目统计的关联表） */
 const SESSION_MAP = {
   id: "id",
@@ -213,28 +194,6 @@ export function subagentSessionIds(sessionRows) {
     if (r?.parentId && knownIds.has(r.parentId)) result.add(r.id);
   }
   return result;
-}
-
-/**
- * 按 started_at 增量拉取 tool_usage。
- * 退役：Task 4 切换导入，Task 8 清零（工具报表随 V2 砍除；main.js 仍在导入故本任务保留）。
- * @param {DatabaseSync|null} db openDb 返回的连接
- * @param {{toolUsage: Set<string>}} schema 列探测结果
- * @param {number} sinceMs 上次拉取的时间下界（epoch 毫秒，开区间）
- * @returns {object[]} camelCase 行数组；started_at 列缺失或库不可用时返回空数组
- */
-export function fetchToolUsage(db, schema, sinceMs) {
-  if (!db || !schema.toolUsage.has("started_at")) return [];
-  const cols = Object.keys(TOOL_USAGE_MAP).filter((c) => schema.toolUsage.has(c));
-  const selectList = cols.map((c) => `"${c}"`).join(", ");
-  const raw = db
-    .prepare(`SELECT ${selectList} FROM tool_usage WHERE "started_at" > ? ORDER BY "started_at" ASC`)
-    .all(sinceMs);
-  return raw.map((r) => {
-    const row = {};
-    for (const c of cols) row[TOOL_USAGE_MAP[c]] = r[c];
-    return row;
-  });
 }
 
 /**
