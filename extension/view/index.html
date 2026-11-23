@@ -3,428 +3,353 @@
 <head>
 <meta charset="utf-8" />
 <title>ZPowerPack · 用量看板</title>
-<!-- 锁定稿字体（沙箱无外网时回退本地栈；数字一律 tabular-nums） -->
-<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Manrope:wght@400;500;700;800&display=swap" rel="stylesheet" />
 <style>
-/* ===== 锁定稿「聚焦主屏」视觉世界（方向契约 .impeccable/surfaces/dashboard.md）=====
-   近黑底 #070a12 + 电青/紫双强调 + 薄荷/琥珀状态 + 珊瑚紧张；拒绝卡片阵列与主题化装置。
-   本文件自包含（宿主只伺服 pageUri 与注册资源，外部 script src 不可用——V1 探针实证）。 */
+/* ===== V2 卡片看板（AI Usage Widget 形态；设计稿 §五.1 布局图与四区说明为唯一权威）=====
+   单文件自包含铁律：宿主对 entry 形态视图只伺服 pageUri 与注册资源，外链 script/字体必失败
+   （V1 探针实证）→ 图标/环形/折线全部内联 SVG，字体走本地栈，数字一律 tabular-nums。
+   沙箱哑渲染铁律：文案/阈值/格式化全部在扩展侧 view-model 完成（Node 侧可 TDD），
+   本文件只做 DOM 绑定与坐标换算，零文案计算。构图：深色大圆角卡片四区
+   （速率条/厂商行/24h 趋势/结论句）+ 右上角手动同步按钮。 */
 *{margin:0;box-sizing:border-box}
 ::selection{background:rgba(110,231,255,.3)}
-html{scrollbar-color:#232b3d #070a12}
-::-webkit-scrollbar{width:10px;height:10px}
-::-webkit-scrollbar-thumb{background:#232b3d;border-radius:6px}
-::-webkit-scrollbar-track{background:transparent}
-body{min-width:1024px;background:#070a12;color:#e8edf6;font:14px/1.55 Manrope,"Microsoft YaHei",sans-serif;display:flex;flex-direction:column;position:relative}
-body::before{content:"";position:fixed;inset:0;background:radial-gradient(60% 34% at 24% 16%,rgba(110,231,255,.09),transparent 62%),radial-gradient(50% 30% at 80% 70%,rgba(167,139,255,.07),transparent 62%);pointer-events:none}
 :focus-visible{outline:1px solid rgba(110,231,255,.6);outline-offset:2px}
+body{background:#070a12;color:#e8edf6;font:14px/1.55 Manrope,"Microsoft YaHei",system-ui,sans-serif;min-height:100vh;display:flex;justify-content:center;align-items:flex-start;padding:32px 20px}
+body::before{content:"";position:fixed;inset:0;background:radial-gradient(60% 34% at 24% 12%,rgba(110,231,255,.07),transparent 62%),radial-gradient(50% 30% at 82% 78%,rgba(167,139,255,.06),transparent 62%);pointer-events:none}
 
-/* ===== 顶栏：品牌 / 范围页签 / 实时指示 ===== */
-.top{height:54px;display:flex;align-items:center;gap:24px;padding:0 40px;position:relative;z-index:4}
-.brand{font:700 16px "Chakra Petch";letter-spacing:.1em}.brand b{color:#6ee7ff}
-.tabs{display:flex;margin-left:auto;background:rgba(22,30,48,.7);border:1px solid rgba(140,180,255,.13);border-radius:999px;padding:3px;gap:2px}
-.tab{padding:4px 15px;border-radius:999px;color:#8fa3c8;font-size:12.5px}
-.tab.on{background:rgba(110,231,255,.15);color:#6ee7ff;font-weight:700}
-.tab[aria-disabled="true"]{color:#566179;cursor:not-allowed}
-.live{font-size:12px;color:#8fa3c8}.live i{display:inline-block;width:8px;height:8px;border-radius:50%;background:#34e3a2;box-shadow:0 0 12px rgba(52,227,162,.8);margin-right:7px;vertical-align:-1px}
-.live.off i{background:#566179;box-shadow:none}
+/* ===== 卡片骨架：四区以细分隔线相接（§五.1 草图的 ├─┤ 分隔形态）===== */
+.card{width:100%;max-width:720px;background:#0c1220;border:1px solid rgba(140,180,255,.13);border-radius:24px;box-shadow:0 24px 70px rgba(0,0,0,.5);overflow:hidden;position:relative;z-index:1}
+.sec{padding:16px 22px}
+.sec + .sec{border-top:1px solid rgba(140,180,255,.1)}
 
-/* ===== 舞台：速率巨字 + 背景 60s 速率历史线 + 三态徽标 ===== */
-.stage{position:relative;height:300px;flex-shrink:0;display:flex;align-items:flex-end;padding:0 40px 26px;overflow:hidden}
-.stage .bg{position:absolute;inset:0;background:radial-gradient(90% 90% at 30% 100%,rgba(110,231,255,.13),transparent 60%),radial-gradient(70% 80% at 90% 100%,rgba(167,139,255,.1),transparent 55%)}
-.stage svg.bgline{position:absolute;left:0;right:0;bottom:52px;width:100%;height:150px;opacity:.5}
-.stage .num{position:relative;z-index:3;font:800 128px/0.88 "Chakra Petch","Cascadia Code",Consolas,monospace;letter-spacing:-.04em;font-variant-numeric:tabular-nums;color:#f7faff;text-shadow:0 0 60px rgba(110,231,255,.35);transition:text-shadow .6s}
-.stage .num.idle{text-shadow:0 0 24px rgba(110,231,255,.12);color:#8fa3c8}
-.stage .meta{position:relative;z-index:3;margin-left:30px;padding-bottom:16px}
-.stage .meta .u{font:600 15px "Chakra Petch",Consolas,monospace;color:#8fa3c8;letter-spacing:.06em}
-.stage .meta .sub{margin-top:12px;display:flex;gap:22px;font-size:13px;color:#8fa3c8;align-items:center}
-.stage .meta .sub b{color:#e8edf6;font:700 16px "Chakra Petch",Consolas,monospace;font-variant-numeric:tabular-nums;margin-left:6px}
-.stage .meta .badge{display:inline-flex;gap:8px;align-items:center;border:1px solid rgba(255,177,77,.5);background:rgba(255,177,77,.1);color:#ffcf7a;border-radius:999px;padding:5px 14px;font-size:12px;font-weight:700;margin-top:14px}
-.stage .meta .badge.idle{border-color:rgba(140,180,255,.35);background:rgba(140,180,255,.08);color:#8fa3c8}
-/* 保持态徽标用绘制的暂停双杠（图标一律画，不用 emoji） */
-.stage .meta .badge .pause{display:inline-flex;gap:3px}.stage .meta .badge .pause i{width:3.5px;height:9px;border-radius:1px;background:currentColor}
+/* ===== 区一 · 速率条：呼吸圆点 + 合计巨字 + 活跃流并列 + 活动时刻 ===== */
+.rate-line{display:flex;align-items:center;gap:12px;min-height:34px}
+.dot{width:9px;height:9px;border-radius:50%;background:#34e3a2;box-shadow:0 0 10px rgba(52,227,162,.75);flex-shrink:0;animation:breath 1.6s ease-in-out infinite}
+.rate-state{font-size:11.5px;color:#8fa3c8;border:1px solid rgba(140,180,255,.2);border-radius:999px;padding:2px 10px;flex-shrink:0;white-space:nowrap}
+.rate-total{font:700 30px/1 "Cascadia Code","Chakra Petch",Consolas,monospace;font-variant-numeric:tabular-nums;letter-spacing:-.01em;color:#f7faff;white-space:nowrap}
+.rate-model{font-size:13px;color:#8fa3c8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rate-streams{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:10px;font-size:12.5px;color:#8fa3c8}
+.rate-streams .st b{color:#dbe6f5;font-family:"Cascadia Code",Consolas,monospace;font-variant-numeric:tabular-nums}
+.rate-streams .st .sub{color:#6d7fa3;margin-left:4px}
+.meta{margin-top:10px;font-size:12px;color:#6d7fa3}
 
-/* ===== 流光缝（唯一 authored 动效：渐变缓行） ===== */
-.seam{height:1px;background:linear-gradient(90deg,transparent,rgba(110,231,255,.4) 30%,rgba(167,139,255,.4) 70%,transparent);background-size:200% 100%;animation:seamflow 9s linear infinite}
-@keyframes seamflow{from{background-position:100% 0}to{background-position:-100% 0}}
-@media (prefers-reduced-motion:reduce){.seam{animation:none}}
+/* ===== 区二 · 厂商行：内联 SVG 环（stroke-dasharray=5h 已用%）+ 状态句 + 右对齐百分比枚举 ===== */
+.vendor{display:flex;align-items:center;gap:14px;padding:13px 0}
+.vendor + .vendor{border-top:1px solid rgba(140,180,255,.08)}
+.ring{width:44px;height:44px;flex-shrink:0}
+.ring circle{fill:none;stroke-width:3.4}
+.ring .ring-bg{stroke:rgba(140,180,255,.14)}
+.ring .ring-fg{stroke-linecap:round;transition:stroke-dasharray .3s ease,stroke .3s ease}
+.v-info{min-width:0;flex:1}
+.v-name{font-size:14px;font-weight:700;color:#e8edf6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.v-status{margin-top:4px;font-size:12px;color:#9db4dd}
+.v-sub{margin-top:3px;font-size:11.5px;color:#6d7fa3}
+.v-percs{flex-shrink:0;display:flex;gap:6px;text-align:right;font-size:12.5px;color:#9db4dd}
+.v-percs .perc{white-space:nowrap}
+.v-percs .perc i{font-style:normal;color:#6d7fa3;margin-right:4px}
+.v-percs .perc b{color:#e8edf6;font-weight:600;font-variant-numeric:tabular-nums}
+.v-empty{padding:12px 0;font-size:12.5px;color:#6d7fa3}
 
-/* ===== 额度水位行 ===== */
-.quota{padding:18px 40px 4px}
-.qh{display:flex;align-items:baseline;gap:14px;margin-bottom:12px}
-.qh h3{font:600 13px "Chakra Petch",Consolas,monospace;letter-spacing:.16em;color:#9db4dd}
-.qh .q{font-size:12px;color:#6d7fa3}
-.qrow{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:20px}
-.pc .gn{display:flex;justify-content:space-between;align-items:baseline;font-size:13px;color:#cfe0f2;margin-bottom:8px}
-.pc .gn .src{font-size:10.5px;color:#6d7fa3}
-.pc .cfg{font-size:10.5px;color:#ffcf7a;border:1px solid rgba(255,207,122,.4);border-radius:999px;padding:2px 9px;margin-left:8px;cursor:help}
-.wl{display:flex;align-items:center;gap:10px;font-size:11.5px;color:#8fa3c8;margin:6px 0}
-.wl .t{width:86px;flex-shrink:0}.wl b{color:#e8edf6;font-variant-numeric:tabular-nums;width:34px;text-align:right}
-.wl .bar{flex:1;height:5px;border-radius:3px;background:rgba(140,180,255,.12);position:relative;overflow:hidden}
-.wl .bar i{position:absolute;inset:0 auto 0 0;border-radius:3px;transition:width .8s}
-.wl .ft{min-width:112px;width:112px;font-size:10px;color:#6d7fa3;text-align:right}
-.wl .ft.tight{color:#ffcf7a}
+/* ===== 区三 · 24h 趋势：内联 SVG 面积折线（橙色系；坐标由脚本按 token 数哑映射）===== */
+.trend-svg{width:100%;height:120px;display:block;margin-top:10px}
+.trend-svg path{transition:opacity .3s ease}
 
-/* ===== 2×3 无边框报表网格 ===== */
-.grid{flex:1;display:grid;grid-template-columns:1fr 1fr 1fr;grid-template-rows:auto auto;gap:0 44px;padding:14px 40px 12px;min-height:0}
-.cx{border-top:1px solid rgba(140,180,255,.14);padding:11px 2px 14px;display:flex;flex-direction:column;min-height:224px}
-.cx h4{font:600 13.5px "Chakra Petch",Consolas,monospace;color:#dbe6f5;cursor:pointer;user-select:none}
-.cx h4:hover{color:#6ee7ff}
-.cx h4 .arrow{display:inline-block;font-size:10px;color:#6d7fa3;margin-left:6px;transition:transform .25s}
-.cx.open h4 .arrow{transform:rotate(90deg)}
-.cx .q{font-size:11.5px;color:#7a8db0;margin:3px 0 8px}
-.hb{display:flex;flex-direction:column;gap:7px;flex:1;justify-content:space-evenly}
-.hb .r{display:grid;grid-template-columns:110px 1fr 70px;gap:8px;align-items:center;font-size:11px;color:#8fa3c8}
-.hb .r b{color:#e8edf6;text-align:right;font-variant-numeric:tabular-nums}
-.bar{height:4px;border-radius:2px;background:rgba(140,180,255,.13);position:relative}
-.bar i{position:absolute;inset:0 auto 0 0;border-radius:2px;transition:width .8s}
-.bar em{position:absolute;top:-2px;width:1.5px;height:8px;background:rgba(232,237,246,.5)}
-.hist{display:flex;align-items:flex-end;gap:4px;flex:1;min-height:56px}
-.hist i{flex:1;border-radius:2px 2px 0 0;background:linear-gradient(180deg,rgba(110,231,255,.75),rgba(110,231,255,.08));transition:height .8s}
-.dots{position:relative;flex:1;min-height:56px}
-.dots i{position:absolute;width:5px;height:5px;border-radius:50%;background:#6ee7ff;box-shadow:0 0 6px rgba(110,231,255,.6)}
-.dots em{position:absolute;left:2%;top:78%;width:94%;border-top:1px solid rgba(167,139,255,.55);transform:rotate(7deg);transform-origin:left}
-.heat{display:grid;grid-template-columns:repeat(24,1fr);gap:2px;flex:1;min-height:56px}
-.heat i{border-radius:2px;background:rgba(110,231,255,.09);transition:background .8s}
-.heat i.h1{background:rgba(110,231,255,.26)}.heat i.h2{background:rgba(110,231,255,.5)}.heat i.h3{background:linear-gradient(135deg,#6ee7ff,#34e3a2)}
-.foot{font-size:10px;color:#6d7fa3;margin-top:6px}
-/* 下钻区（报表卡展开：按模型实时速率 / 工具调用统计） */
-.drill{display:none;margin-top:9px;border-top:1px dashed rgba(140,180,255,.14);padding-top:8px}
-.cx.open .drill{display:block}
-.drill .dr{display:flex;justify-content:space-between;font-size:11px;color:#8fa3c8;padding:2.5px 0}
-.drill .dr b{color:#cfe0f2;font-variant-numeric:tabular-nums;font-family:"Chakra Petch",Consolas,monospace}
-.drill .dh{font:600 10.5px "Chakra Petch",Consolas,monospace;letter-spacing:.14em;color:#6d7fa3;margin-bottom:5px}
-/* 空态/骨架 */
-.empty{flex:1;display:flex;align-items:center;justify-content:center;font-size:11.5px;color:#6d7fa3;min-height:56px}
-.sk{flex:1;min-height:56px;border-radius:4px;background:linear-gradient(100deg,rgba(140,180,255,.06) 40%,rgba(140,180,255,.12) 50%,rgba(140,180,255,.06) 60%);background-size:200% 100%;animation:skl 1.2s linear infinite}
-@keyframes skl{from{background-position:120% 0}to{background-position:-20% 0}}
+/* ===== 区四 · 结论句 ===== */
+.conclusion{font-size:13px;color:#cfe0f2}
+.conclusion::before{content:"◈";color:#ff8f6b;margin-right:8px}
 
-/* ===== 视图内迷你 dock（与 composer.status 同源同规则） ===== */
-.dock{height:44px;border-top:1px solid rgba(140,180,255,.14);display:flex;align-items:center;gap:18px;padding:0 40px;background:rgba(8,12,22,.94);position:relative;z-index:5;margin-top:10px}
-.dock .k{font:600 10px "Chakra Petch",Consolas,monospace;letter-spacing:.18em;color:#6d7fa3}
-.dock b{font:700 16px "Chakra Petch",Consolas,monospace;color:#6ee7ff;font-variant-numeric:tabular-nums}
-.dock .cur{font-size:12px;color:#9db4dd}.dock .cur b{color:#e8edf6;font-family:Manrope;font-size:12.5px}
-.dock .q{display:flex;align-items:center;gap:6px;font-size:11px;color:#8fa3c8}.dock .q .bar{width:44px}
-.dock .note{margin-left:auto;font-size:11px;color:#6d7fa3}
+/* ===== 手动同步按钮（右上角）：拉取中 disabled+旋转图标，10s 超时复位 ===== */
+.sync-btn{margin-left:auto;display:inline-flex;align-items:center;gap:7px;height:30px;padding:0 13px;border-radius:999px;border:1px solid rgba(140,180,255,.22);background:rgba(22,30,48,.75);color:#9db4dd;font-size:12px;font-family:inherit;cursor:pointer;flex-shrink:0}
+.sync-btn:hover:not(:disabled){border-color:rgba(110,231,255,.45);color:#6ee7ff}
+.sync-btn:disabled{cursor:default;opacity:.6}
+.sync-btn .sync-icon{animation:none}
+.sync-btn.busy .sync-icon{animation:spin 1s linear infinite}
 
-/* 加载首帧骨架覆盖（数据到达前整体占位） */
-#boot{position:fixed;inset:0;background:#070a12;display:flex;align-items:center;justify-content:center;color:#6d7fa3;font-size:13px;z-index:9;transition:opacity .4s}
+/* ===== 数字过渡类：全部数字节点挂 num-t，值变化经 300ms 淡入上屏 ===== */
+.num-t{transition:opacity .3s ease}
+
+/* ===== 功能动画仅两枚：呼吸圆点 + 同步旋转；prefers-reduced-motion 下全部关闭 ===== */
+@keyframes breath{0%,100%{opacity:1}50%{opacity:.35}}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){
+  *{animation:none!important;transition:none!important}
+}
+
+/* ===== 同步失败 toast 与首帧连接遮罩 ===== */
+.toast{position:fixed;left:50%;bottom:34px;transform:translate(-50%,14px);background:#1a2233;border:1px solid rgba(255,143,107,.45);color:#ffc9b5;padding:9px 18px;border-radius:12px;font-size:12.5px;opacity:0;pointer-events:none;transition:opacity .25s,transform .25s;z-index:9}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+#boot{position:fixed;inset:0;background:#070a12;display:flex;align-items:center;justify-content:center;color:#6d7fa3;font-size:13px;z-index:8;transition:opacity .4s}
 #boot.hide{opacity:0;pointer-events:none}
 </style>
 </head>
 <body>
 <div id="boot">正在连接数据通道…</div>
-<div class="top">
-  <span class="brand">Z<b>Power</b>Pack</span>
-  <div class="tabs">
-    <span class="tab on" id="tab-today">今日</span>
-    <span class="tab" id="tab-7d" aria-disabled="true" title="数据底座保留 24 小时，更长范围规划中">7 天</span>
-    <span class="tab" id="tab-30d" aria-disabled="true" title="数据底座保留 24 小时，更长范围规划中">30 天</span>
-  </div>
-  <span class="live" id="live-ind"><i></i><span id="live-text">实时 · 连接中</span></span>
-</div>
 
-<div class="stage">
-  <div class="bg"></div>
-  <svg class="bgline" viewBox="0 0 1440 150" preserveAspectRatio="none" fill="none">
-    <defs>
-      <linearGradient id="pg" x1="0" y1="0" x2="1" y2="0">
-        <stop offset="0" stop-color="#6ee7ff" stop-opacity="0"/>
-        <stop offset=".4" stop-color="#6ee7ff" stop-opacity=".8"/>
-        <stop offset="1" stop-color="#a78bfa" stop-opacity=".9"/>
-      </linearGradient>
-    </defs>
-    <path id="ratepath" d="" stroke="url(#pg)" stroke-width="2.5"/>
-    <path id="ratefill" d="" fill="url(#pg)" opacity=".07"/>
-  </svg>
-  <span class="num" id="stg-num">—</span>
-  <div class="meta">
-    <div class="u">tok/s · 每秒生成的 token 数</div>
-    <div class="sub">
-      <span>主会话<b id="stg-main">—</b></span>
-      <span>subagent<b id="stg-sub">—</b></span>
-      <span>最近 60 秒 · 时长加权</span>
+<div class="card">
+  <!-- 区一 · 速率条：呼吸圆点（活跃流在飞）+ 合计巨字 + 手动同步按钮（§五.1 右上角） -->
+  <div class="sec" data-testid="rate-bar">
+    <div class="rate-line">
+      <i class="dot" id="rate-dot" style="display:none"></i>
+      <span class="rate-state num-t" id="rate-state">—</span>
+      <b class="rate-total num-t" id="rate-total"></b>
+      <span class="rate-model" id="rate-model"></span>
+      <button class="sync-btn" id="sync-btn" data-testid="sync-btn" title="立即拉取官方额度" aria-label="手动同步官方额度">手动同步
+        <svg class="sync-icon" viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.7-4"/><path d="M13.6 1.6v2.7h-2.7"/></svg>
+      </button>
     </div>
-    <div id="stg-badge" style="display:none"></div>
+    <div class="rate-streams" id="rate-streams" style="display:none"></div>
+    <div class="meta num-t" id="rate-meta" style="display:none"></div>
   </div>
+
+  <!-- 区二 · 厂商行：脚本按 panel.vendors 实例化（行模板带 data-testid="vendor-row"） -->
+  <div class="sec" id="vendor-list"></div>
+
+  <!-- 区三 · 24h 趋势：内联 SVG 面积折线（无外链）；foot 累计句来自 view-model -->
+  <div class="sec">
+    <svg class="trend-svg" data-testid="trend-chart" id="trend-chart" viewBox="0 0 640 120" preserveAspectRatio="none" role="img" aria-label="近 24 小时 token 消耗趋势">
+      <defs>
+        <linearGradient id="tg" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stop-color="#ff8f6b" stop-opacity=".35"/>
+          <stop offset="1" stop-color="#ff8f6b" stop-opacity=".02"/>
+        </linearGradient>
+      </defs>
+      <path id="trend-fill" fill="url(#tg)" d=""/>
+      <path id="trend-line" fill="none" stroke="#ff8f6b" stroke-width="2" stroke-linejoin="round" d=""/>
+    </svg>
+    <div class="meta num-t" id="trend-foot"></div>
+  </div>
+
+  <!-- 区四 · 结论句（view-model 外推文案直渲） -->
+  <div class="sec conclusion num-t" data-testid="conclusion-line" id="conclusion-line">—</div>
 </div>
 
-<div class="seam"></div>
-
-<div class="quota">
-  <div class="qh">
-    <h3>额度水位</h3>
-    <span class="q" id="quota-note">各窗口还能用多少？多久恢复？—— 已用百分比 · 60%/85% 双色警示</span>
-  </div>
-  <div class="qrow" id="quota-row"></div>
-</div>
-
-<div class="grid">
-  <div class="cx" id="cx-speed">
-    <h4>模型速度对比<span class="arrow">▶</span></h4>
-    <div class="q">哪家模型平时吐字快？慢起来会多慢？</div>
-    <div class="hb" id="speed-rows"></div>
-    <div class="foot" id="speed-foot">亮段=典型速度 · 白刻度=慢的时候</div>
-    <div class="drill"><div class="dh">实时按模型 · 60 秒窗口</div><div id="speed-drill"></div></div>
-  </div>
-  <div class="cx" id="cx-ttft">
-    <h4>首字等待</h4>
-    <div class="q">按下发送后，要等多久才蹦出第一个字？</div>
-    <div class="hist" id="ttft-hist"></div>
-    <div class="foot" id="ttft-foot">暂无首字等待数据</div>
-  </div>
-  <div class="cx" id="cx-ctx">
-    <h4>对话越长会变慢吗</h4>
-    <div class="q">上下文变大时的速度变化</div>
-    <div class="dots" id="ctx-dots"><em></em></div>
-    <div class="foot" id="ctx-foot">样本积累中，暂不足以判断</div>
-  </div>
-  <div class="cx" id="cx-heat">
-    <h4>时段热力</h4>
-    <div class="q">一天里什么时候用得最凶？</div>
-    <div class="heat" id="heat-cells"></div>
-    <div class="foot" id="heat-foot">暂无时段数据</div>
-  </div>
-  <div class="cx" id="cx-proj">
-    <h4>按项目消耗</h4>
-    <div class="q">每个项目各花了多少？</div>
-    <div class="hb" id="proj-rows"></div>
-    <div class="foot" id="proj-foot">近 24 小时 · subagent 归入父项目</div>
-  </div>
-  <div class="cx" id="cx-health">
-    <h4>谁家更不容易翻车<span class="arrow">▶</span></h4>
-    <div class="q">失败与自动重试的比例 · 近 24 小时</div>
-    <div class="hb" id="health-rows"></div>
-    <div class="foot" id="health-foot">失败率 · 悬停看重试率</div>
-    <div class="drill"><div class="dh">工具调用统计 · 近 24 小时</div><div id="tools-drill"></div></div>
-  </div>
-</div>
-
-<div class="dock">
-  <span class="k">迷你常驻态</span>
-  <span class="cur">最近请求：<b id="dock-provider">—</b></span>
-  <b id="dock-rate">— tok/s</b>
-  <span id="dock-windows" style="display:flex;gap:18px"></span>
-  <span class="note" id="dock-note">跟随最近请求的厂商 · 点击会话区状态条可回到本看板</span>
-</div>
+<div id="toast" class="toast" role="alert"></div>
 
 <script>
 "use strict";
-/* 沙箱侧哑渲染：唯一取数通道 = 注册资源 zpowerpack://display（1s 轮询，与扩展 tick 同节奏）。
-   全部文案/阈值/格式化已在扩展侧 view-model 完成；本脚本只做 DOM 绑定与 60s 速率历史积累。 */
+/* 沙箱哑渲染（V2）：唯一取数通道 = 注册资源 zpowerpack://display（宿主 MCP 桥），
+   展示模型 {strip, panel} 的全部文案/阈值/格式化已在扩展侧 view-model 完成，本脚本
+   只做 DOM 绑定、SVG 坐标换算与通道管理。取数双保险（扩展侧 notify 推送链宿主实证 +
+   沙箱 window.zcode 订阅入口暴露性未证实）：①启动时 typeof 探测一切可用订阅形态，
+   任何失败静默跳过；②无论订阅成败保留 1s 轻轮询兜底（V2 载荷小，无压力）。 */
 
-var HISTORY_MAX = 60;                     // 舞台背景线保留 60 个采样点（约 60 秒）
-var rateHistory = [];                     // [{v:number}] 采样序列（值为 null 的点跳过）
+var POLL_FALLBACK_MS = 1000; // 轮询兜底节奏：订阅不可达/丢通知时数据新鲜度的下限
+var SYNC_TIMEOUT_MS = 10000; // 同步按钮超时复位：readResource 悬挂时按钮不得永久禁用
+var TOAST_MS = 4000;         // 失败提示停留时长
+var RING_C = 100;            // 环周长归一（r=15.9 → 2πr≈100）：stroke-dasharray 直接用百分比
+
 var el = function (id) { return document.getElementById(id); };
-var lastBadged = null;                    // 徽标节点复用（避免每秒重建）
 
-/** 注册资源读取：宿主 MCP 桥接（探针实证 window.zcode 于 entry 视图可用） */
-function readDisplay() {
+/** 注册资源读取（宿主 MCP 桥）：display=展示模型 JSON 主通道，sync=手动同步触发通道 */
+function readResource(uri) {
   var z = window.zcode;
   if (!z || typeof z.readResource !== "function") return Promise.reject(new Error("window.zcode 不可用"));
-  return z.readResource("zpowerpack://display").then(function (resp) {
+  return z.readResource(uri).then(function (resp) {
     var text = resp && resp.contents && resp.contents[0] && resp.contents[0].text;
     if (!text) throw new Error("资源响应为空");
-    return JSON.parse(text);
+    return text;
   });
 }
 
-/** 舞台背景速率线：由客户端逐秒积累的采样生成贝塞尔路径（无数据时清空） */
-function drawRateLine() {
-  var pts = rateHistory.filter(function (p) { return typeof p.v === "number" && p.v >= 0; });
-  var path = document.getElementById("ratepath");
-  var fill = document.getElementById("ratefill");
-  if (pts.length < 2) { path.setAttribute("d", ""); fill.setAttribute("d", ""); return; }
-  var maxV = Math.max.apply(null, pts.map(function (p) { return p.v; })) * 1.08 || 1;
-  var step = 1440 / (HISTORY_MAX - 1);
-  var x = 1440 - (pts.length - 1) * step; // 从右往左排布，新数据在右侧
-  var d = "M" + x.toFixed(1) + "," + (150 - (pts[0].v / maxV) * 130).toFixed(1);
-  for (var i = 1; i < pts.length; i++) {
-    var nx = x + i * step;
-    var ny = 150 - (pts[i].v / maxV) * 130;
-    var mx = (nx - step / 2).toFixed(1);
-    d += " C" + mx + "," + (150 - (pts[i - 1].v / maxV) * 130).toFixed(1) + " " + mx + "," + ny.toFixed(1) + " " + nx.toFixed(1) + "," + ny.toFixed(1);
-  }
-  path.setAttribute("d", d);
-  fill.setAttribute("d", d + " L1440,150 L" + x.toFixed(1) + ",150 Z");
+/** 取数主通道：display 展示模型（{strip, panel}，字段全由扩展侧备好） */
+function readDisplay() {
+  return readResource("zpowerpack://display").then(function (text) { return JSON.parse(text); });
 }
 
-/** 舞台：巨字 / 主子分列 / 三态徽标（徽标用绘制的暂停双杠，不用 emoji） */
-function renderStage(dm) {
-  var num = el("stg-num");
-  num.textContent = dm.stage.valueText;
-  num.className = "num" + (dm.stage.state === "idle" ? " idle" : "");
-  el("stg-main").textContent = dm.stage.main === null ? "—" : dm.stage.main;
-  el("stg-sub").textContent = dm.stage.subagent === null ? "—" : dm.stage.subagent;
-
-  var badge = el("stg-badge");
-  if (dm.stage.badgeText) {
-    badge.style.display = "inline-flex";
-    badge.className = "meta badge" + (dm.stage.state === "idle" ? " idle" : "");
-    if (lastBadged !== dm.stage.state) {
-      badge.innerHTML = (dm.stage.state === "held" ? '<span class="pause"><i></i><i></i></span>' : "") + "<span>" + dm.stage.badgeText + "</span>";
-      lastBadged = dm.stage.state;
-    } else {
-      var span = badge.querySelector("span:last-child");
-      if (span) span.textContent = dm.stage.badgeText;
-    }
-  } else {
-    badge.style.display = "none";
-    lastBadged = null;
-  }
-
-  // 采样积累（live 记实际值；held/idle 不推进历史线，避免假波动）
-  var numeric = parseFloat(dm.stage.valueText);
-  if (dm.stage.state === "live" && !isNaN(numeric)) {
-    rateHistory.push({ v: numeric });
-    if (rateHistory.length > HISTORY_MAX) rateHistory.shift();
-  }
-  drawRateLine();
-
-  // 实时指示
-  var ind = el("live-ind");
-  ind.className = "live" + (dm.stage.state === "live" ? "" : " off");
-  el("live-text").textContent = (dm.stage.state === "live" ? "实时 · " : "") + dm.stage.asOfText;
-}
-
-/** 额度水位行（数据驱动实例与窗口；needsConfig 出提示徽标） */
-function renderQuota(dm) {
-  var row = el("quota-row");
-  if (!dm.quota.rows || dm.quota.rows.length === 0) {
-    row.innerHTML = '<div class="pc"><div class="empty">' + (dm.quota.emptyText || "暂无额度数据") + "</div></div>";
-    return;
-  }
-  var html = "";
-  dm.quota.rows.forEach(function (pc) {
-    html += '<div class="pc"><div class="gn"><span>' + esc(pc.name) +
-      (pc.needsConfig ? '<span class="cfg" title="官方未提供分母；后续版本可在插件设置配置默认额度">配置分母</span>' : "") +
-      '</span><span class="src">' + esc(pc.srcLabel) + "</span></div>";
-    pc.windows.forEach(function (w) {
-      html += '<div class="wl"><span class="t">' + esc(w.label) + '</span><span class="bar"><i style="width:' +
-        (w.pct === null ? 0 : Math.min(100, w.pct)) + "%;background:" + w.barColor + '"></i></span><b>' +
-        (w.pct === null ? "—" : w.pct + "%") + '</b><span class="ft' + (w.footText.indexOf("紧张") >= 0 ? " tight" : "") + '">' + esc(w.footText) + "</span></div>";
-    });
-    html += "</div>";
-  });
-  row.innerHTML = html;
-}
-
-/** 报表行（速度/项目/健康三卡共用条形行结构） */
-function barRows(rows, hoverKey) {
-  if (!rows || rows.length === 0) return '<div class="empty">暂无数据</div>';
-  var html = "";
-  rows.forEach(function (r) {
-    var h = hoverKey ? ' title="' + esc(r[hoverKey]) + '"' : "";
-    html += '<div class="r"' + h + "><span>" + esc(r.label) + '</span><span class="bar"><i style="width:' +
-      r.widthPct + "%;background:" + r.color + '">' + (r.markerLeft ? '<em style="left:' + r.markerLeft + '%"></em>' : "") +
-      "</i></span><b>" + esc(r.valueText) + "</b></div>";
-  });
-  return html;
-}
-
-/** 六张报表卡（hasData=false 给空态；下钻区由卡片标题点击展开） */
-function renderGrid(dm) {
-  var g = dm.grid;
-
-  el("speed-rows").innerHTML = g.speed.hasData ? barRows(g.speed.rows) : '<div class="empty">暂无模型样本</div>';
-  el("speed-foot").textContent = g.speed.hasData ? g.speed.foot : "完成一次请求后开始统计";
-  el("speed-drill").innerHTML = (g.speed.detail && g.speed.detail.length)
-    ? g.speed.detail.map(function (d) {
-        return '<div class="dr"><span>' + esc(d.modelId) + "</span><b>" + (d.genRateText === null ? "—" : d.genRateText) + " tok/s</b></div>";
-      }).join("")
-    : '<div class="dr"><span>窗口内暂无在跑模型</span><b>—</b></div>';
-
-  el("ttft-hist").innerHTML = g.ttft.hasData
-    ? g.ttft.hist.map(function (h) { return '<i style="height:' + Math.max(3, h) + '%"></i>'; }).join("")
-    : '<div class="empty">暂无首字等待数据</div>';
-  el("ttft-foot").textContent = g.ttft.foot;
-
-  if (g.ctx.hasData) {
-    el("ctx-dots").innerHTML = g.ctx.dots.map(function (d) {
-      return '<i style="left:' + d.left + "%;top:" + d.top + '%"></i>';
-    }).join("") + "<em></em>";
-  } else {
-    el("ctx-dots").innerHTML = '<div class="empty">样本积累中</div>';
-  }
-  el("ctx-foot").textContent = g.ctx.foot;
-
-  el("heat-cells").innerHTML = g.heat.hasData
-    ? g.heat.cells.map(function (c) { return '<i class="' + c.level + '"></i>'; }).join("")
-    : '<div class="empty">暂无时段数据</div>';
-  el("heat-foot").textContent = g.heat.foot;
-
-  el("proj-rows").innerHTML = g.projects.hasData ? barRows(g.projects.rows) : '<div class="empty">暂无项目消耗</div>';
-  el("proj-foot").textContent = g.projects.foot;
-
-  el("health-rows").innerHTML = g.health.hasData ? barRows(g.health.rows, "hover") : '<div class="empty">暂无稳定性样本</div>';
-  el("health-foot").textContent = g.health.foot;
-  el("tools-drill").innerHTML = (g.tools && g.tools.length)
-    ? g.tools.map(function (t) {
-        return '<div class="dr"><span>' + esc(t.label) + " ×" + t.calls + (t.errors ? '（失败 ' + t.errors + "）" : "") +
-          "</span><b>" + (t.avgMs === null ? "—" : t.avgMs) + " ms 均耗</b></div>";
-      }).join("")
-    : '<div class="dr"><span>暂无工具调用记录</span><b>—</b></div>';
-}
-
-/** 视图内 dock（与 composer.status 迷你条同源同规则） */
-function renderDock(dm) {
-  el("dock-provider").textContent = dm.dock.providerName;
-  el("dock-rate").textContent = dm.dock.rateText;
-  el("dock-windows").innerHTML = (dm.dock.windows || []).map(function (w) {
-    return '<span class="q">' + esc(w.shortLabel) + '<span class="bar"><i style="width:' +
-      (w.pct === null ? 0 : Math.min(100, w.pct)) + "%;background:" + w.barColor + '"></i></span>' +
-      (w.pct === null ? "—" : w.pct + "%") + "</span>";
-  }).join("");
-  el("dock-note").textContent = dm.dock.followNote + " · 点击会话区状态条可回到本看板";
-}
-
-/** HTML 转义（展示模型里的名称类字段一律过此関） */
+/** HTML 转义：展示模型的名称类字段进入 innerHTML 模板前一律过此関 */
 function esc(s) {
-  return String(s === null || s === undefined ? "—" : s)
+  return String(s === null || s === undefined ? "" : s)
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-/** 渲染入口：首次数据到达后解除 boot 覆盖；按节差异渲染（数据不变不重建 DOM，降低每秒 DOM 抖动） */
+/**
+ * 数字/文本节点更新：值变化时经 300ms 透明度过渡上屏（num-t 类），同值不动。
+ * prefers-reduced-motion 下过渡被 CSS 全关，赋值即时生效，无动画副作用。
+ */
+function setNum(node, text) {
+  if (node.textContent === text) return;
+  node.textContent = text;
+  node.style.opacity = ".45";
+  void node.offsetWidth; // 强制回流，让过渡从半透明起点开始
+  node.style.opacity = "1";
+}
+
+/** 区一 · 速率条：圆点=活跃流在飞；头行=合计/末值（单流并入模型名）；次行=多流并列；三行=活动时刻 */
+var lastStreamsHtml = "";
+function renderRate(rate) {
+  var streams = Array.isArray(rate.streams) ? rate.streams : [];
+  el("rate-dot").style.display = streams.length > 0 ? "" : "none";
+  setNum(el("rate-state"), rate.stateText === null || rate.stateText === undefined ? "" : rate.stateText);
+  setNum(el("rate-total"), rate.totalText === null || rate.totalText === undefined ? "" : rate.totalText);
+  // 单流时模型名并入头行（§五.1「428 tok/s · glm-4.7」）；多流并列在次行（§五.2 多流口径 a）
+  el("rate-model").textContent = streams.length === 1 ? "· " + streams[0].modelId : "";
+  var html = streams.length > 1
+    ? streams.map(function (s) {
+        return '<span class="st">' + esc(s.modelId) + " <b>" + esc(s.tpsText) + "</b> tok/s" +
+          (s.isSubText ? '<span class="sub">（' + esc(s.isSubText) + "）</span>" : "") + "</span>";
+      }).join("")
+    : "";
+  if (html !== lastStreamsHtml) {
+    lastStreamsHtml = html;
+    var box = el("rate-streams");
+    box.innerHTML = html;
+    box.style.display = html === "" ? "none" : "";
+  }
+  var meta = el("rate-meta");
+  var metaText = rate.lastActivityText === null || rate.lastActivityText === undefined ? "" : rate.lastActivityText;
+  if (meta.textContent !== metaText) {
+    meta.textContent = metaText;
+    meta.style.display = metaText === "" ? "none" : "";
+  }
+}
+
+/** 区二 · 厂商行模板：内联 SVG 环（dasharray=已用%、色=view-model 语义色直渲）+
+ *  状态句/副行直渲（低水位与紧张态文案均在 view-model 侧定稿，视图不自创）+
+ *  右对齐窗口百分比枚举（OpenCode 三枚全量；字段零加工） */
+function vendorRowHtml(v) {
+  var pct = typeof v.ringPct === "number" ? Math.max(0, Math.min(100, v.ringPct)) : 0;
+  var percs = (v.percents || []).map(function (p) {
+    var val = typeof p.pct === "number" ? p.pct + "%" : "—";
+    return '<span class="perc"><i>' + esc(p.label) + '</i><b class="num-t">' + val + "</b></span>";
+  }).join("");
+  return '<div class="vendor" data-testid="vendor-row">' +
+    '<svg class="ring" viewBox="0 0 44 44" aria-hidden="true">' +
+    '<circle class="ring-bg" cx="22" cy="22" r="15.9"/>' +
+    '<g transform="rotate(-90 22 22)"><circle class="ring-fg" cx="22" cy="22" r="15.9" stroke="' + esc(v.ringColor) +
+    '" style="stroke-dasharray:' + pct + " " + (RING_C - pct) + '"/></g>' +
+    "</svg>" +
+    '<div class="v-info"><div class="v-name">' + esc(v.name) + "</div>" +
+    (v.statusText ? '<div class="v-status num-t">' + esc(v.statusText) + "</div>" : "") +
+    (v.subText ? '<div class="v-sub">' + esc(v.subText) + "</div>" : "") +
+    "</div>" +
+    '<div class="v-percs">' + percs + "</div>" +
+    "</div>";
+}
+
+/** 区二 · 厂商行列表：无实例时给静态占位（未配 provider 的刚装形态） */
+function renderVendors(vendors) {
+  var list = Array.isArray(vendors) ? vendors : [];
+  el("vendor-list").innerHTML = list.length === 0
+    ? '<div class="v-empty">暂无额度数据</div>'
+    : list.map(vendorRowHtml).join("");
+}
+
+/** 区三 · 24h 趋势：view-model 24 点（x=序号、y=token 数）→ 内联 SVG 面积折线坐标换算 */
+function renderTrend(trend) {
+  var pts = Array.isArray(trend.points) ? trend.points : [];
+  var line = el("trend-line");
+  var fill = el("trend-fill");
+  if (pts.length < 2) {
+    line.setAttribute("d", "");
+    fill.setAttribute("d", "");
+  } else {
+    var W = 640, H = 120, PAD = 6;
+    var maxY = 1;
+    for (var i = 0; i < pts.length; i++) if (pts[i].y > maxY) maxY = pts[i].y;
+    var step = W / (pts.length - 1);
+    var d = "";
+    for (var j = 0; j < pts.length; j++) {
+      var x = (j * step).toFixed(1);
+      var y = (H - PAD - (pts[j].y / maxY) * (H - PAD * 2)).toFixed(1);
+      d += (j === 0 ? "M" : "L") + x + "," + y;
+    }
+    line.setAttribute("d", d);
+    fill.setAttribute("d", d + "L" + W + "," + H + " L0," + H + " Z");
+  }
+  setNum(el("trend-foot"), trend.footText === null || trend.footText === undefined ? "" : trend.footText);
+}
+
+/** 渲染入口：速率条文本级常刷（数字逐秒可变）；厂商行/趋势按 JSON 差异重建，降低 DOM 抖动 */
 var booted = false;
-var lastQuotaJson = "";
-var lastGridJson = "";
-var lastDockJson = "";
+var lastVendorsJson = "";
+var lastTrendJson = "";
 function render(dm) {
-  if (!dm || !dm.stage) return;
-  if (!booted) { booted = true; document.getElementById("boot").classList.add("hide"); }
-  // 舞台是文本级更新（数字/时刻每秒变化，代价可忽略），始终刷新
-  renderStage(dm);
-  var qj = JSON.stringify(dm.quota);
-  if (qj !== lastQuotaJson) { lastQuotaJson = qj; renderQuota(dm); }
-  var gj = JSON.stringify(dm.grid);
-  if (gj !== lastGridJson) { lastGridJson = gj; renderGrid(dm); }
-  var dj = JSON.stringify(dm.dock);
-  if (dj !== lastDockJson) { lastDockJson = dj; renderDock(dm); }
+  if (!dm || !dm.panel) return;
+  if (!booted) { booted = true; el("boot").classList.add("hide"); }
+  renderRate(dm.panel.rate);
+  var vj = JSON.stringify(dm.panel.vendors);
+  if (vj !== lastVendorsJson) { lastVendorsJson = vj; renderVendors(dm.panel.vendors); }
+  var tj = JSON.stringify(dm.panel.trend);
+  if (tj !== lastTrendJson) { lastTrendJson = tj; renderTrend(dm.panel.trend); }
+  var c = dm.panel.conclusion;
+  setNum(el("conclusion-line"), c && typeof c.text === "string" ? c.text : "");
 }
 
-/** 主循环：1s 轮询注册资源；连续失败进入降级提示（不伪装成空数据） */
-var failCount = 0;
-function poll() {
-  readDisplay()
-    .then(function (dm) { failCount = 0; render(dm); })
-    .catch(function (e) {
-      failCount++;
-      if (!booted) {
-        document.getElementById("boot").textContent = "数据通道连接中…（" + (e && e.message ? e.message : "未知错误") + "）";
-      } else if (failCount === 5) {
-        el("live-text").textContent = "通道中断 · 重试中";
-        el("live-ind").className = "live off";
-      }
-    });
+/**
+ * 失败提示（同步不可达/超时）：4s 自动隐没，新一轮提示先清旧计时。
+ * 文案「同步失败：官方接口不可达」为简报钉死的视图侧唯一固定交互文案（view-model 不提供）。
+ */
+var toastTimer = null;
+function toast(msg) {
+  var t = el("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(function () { t.classList.remove("show"); }, TOAST_MS);
 }
-poll();
-setInterval(poll, 1000);
 
-/** 报表卡下钻：点击卡片标题切换展开（速度→按模型实时；健康→工具统计） */
-["cx-speed", "cx-health"].forEach(function (id) {
-  var card = document.getElementById(id);
-  card.querySelector("h4").addEventListener("click", function () { card.classList.toggle("open"); });
-});
+/**
+ * 手动同步（§五.4）：read sync 资源 → 扩展侧置待办即时拉取官方额度 → 成功重渲。
+ * 拉取中 disabled+旋转图标；10s 超时复位（readResource 悬挂不得永久锁按钮）；失败/超时出中文 toast。
+ */
+var syncBusy = false;
+function doSync() {
+  if (syncBusy) return;
+  syncBusy = true;
+  var btn = el("sync-btn");
+  btn.disabled = true;
+  btn.classList.add("busy");
+  var settled = false;
+  var guard = setTimeout(function () { finish(false); }, SYNC_TIMEOUT_MS);
+  function finish(ok) {
+    if (settled) return;
+    settled = true;
+    clearTimeout(guard);
+    syncBusy = false;
+    btn.disabled = false;
+    btn.classList.remove("busy");
+    if (!ok) toast("同步失败：官方接口不可达");
+  }
+  readResource("zpowerpack://sync").then(
+    function () { finish(true); refresh(); },
+    function () { finish(false); }
+  );
+}
+el("sync-btn").addEventListener("click", doSync);
+
+/** 订阅形态探测（真机校准点，暴露性未证实）：readResource 之外的一切可用订阅形态
+ *  逐一 typeof 探测、先成功者胜，任何异常/缺位静默跳过——轮询兜底常在，订阅只是加速器。 */
+function trySubscribe() {
+  var z = window.zcode;
+  if (!z) return false;
+  var uri = "zpowerpack://display";
+  var binds = [
+    function () { return typeof z.subscribe === "function" && (z.subscribe(uri, refresh), true); },
+    function () { return !!z.resources && typeof z.resources.subscribe === "function" && (z.resources.subscribe(uri, refresh), true); },
+    function () { return typeof z.onResourceUpdated === "function" && (z.onResourceUpdated(uri, refresh), true); },
+  ];
+  for (var i = 0; i < binds.length; i++) {
+    try {
+      if (binds[i]()) return true;
+    } catch (e) {
+      /* 静默：候选形态失败不阻塞轮询兜底 */
+    }
+  }
+  return false;
+}
+
+/** 数据刷新入口（订阅回调/轮询/同步成功共用）：读 display → 差异渲染。
+ *  失败不伪装成空数据：首帧前更新遮罩提示，首帧后静默重试（画面保持最后真值不假动）。 */
+function refresh() {
+  readDisplay().then(function (dm) {
+    render(dm);
+  }, function (e) {
+    if (!booted) el("boot").textContent = "数据通道连接中…（" + (e && e.message ? e.message : "未知错误") + "）";
+  });
+}
+
+trySubscribe();
+refresh();
+setInterval(refresh, POLL_FALLBACK_MS);
 </script>
 </body>
 </html>

@@ -5,6 +5,8 @@
  * 再直驱 onGenerateEvent 钉「官方事件 → 素条点亮」端到端链路；任何输出不含密钥。
  * Task 6 接线扩展：workbench/context mock 下会话作用域素条（slots 第三参）、
  * notify 推送链句柄、sync 资源即时拉取（停拍隔离验证）。
+ * Task 7 视图消费契约扩展：display 载荷 V2 形状全链钉死（视图哑渲染绑定面）与
+ * sync 返回 quota 的窗口形状（视图重渲数据源）。
  *
  * HTTP 边界排除（Ruling 沿用）：provider 夹具无 apiKey → computeQuota 走 unavailable
  * 分支不发请求；厂商接口已由 quota-fetch.test 注入 fetch 全覆盖，真实联调归真机验收。
@@ -156,6 +158,15 @@ test("集成：真实 schema db + provider 夹具 → activate 全链 → 快照
     snapAtSync = JSON.parse(readFileSync(snapshotPath, "utf8"));
     assert.deepEqual(Object.keys(syncQuota), ["quota"], "sync 返回 {quota} 载荷");
     assert.equal(syncQuota.quota.length, 3, "sync 即时拉取返回三家实例额度");
+    // Task 7 视图消费契约：sync 返回的 quota 行窗口形状=厂商行重渲数据源（六键契约）
+    for (const q of syncQuota.quota) {
+      assert.ok(Array.isArray(q.windows), "sync quota 行须带 windows 数组");
+      for (const w of q.windows) {
+        for (const key of ["type", "used", "limit", "percent", "source", "nextResetMs"]) {
+          assert.ok(key in w, `sync 窗口缺 ${key} 键（视图厂商行消费契约）`);
+        }
+      }
+    }
     assert.ok(snapAtSync.generatedAt >= before, "sync 触发的即时拍重写快照文件");
     assert.equal(notifyCalls.length, notifyAtClose, "视图关闭后 sync 拍不得再通知已关闭视图");
   } finally {
@@ -208,6 +219,37 @@ test("集成：真实 schema db + provider 夹具 → activate 全链 → 快照
   assert.equal(display.panel.rate.stateText, "生成中");
   assert.equal(display.panel.rate.totalText, "428 tok/s");
   assert.equal(display.panel.vendors.length, 3, "三家厂商行全出");
+  // ---- ⑤b 视图消费契约（Task 7 视图全量重写后的哑渲染绑定面）：display 载荷 V2 形状全链 ----
+  // 顶层/四区键序固定：视图差异渲染按段比对，多键即破坏哑绑定契约
+  assert.deepEqual(Object.keys(display), ["strip", "panel"], "display 顶层只含 strip/panel");
+  assert.deepEqual(Object.keys(display.panel), ["rate", "vendors", "trend", "conclusion"], "panel 四区键齐");
+  // 速率条绑定字段：各流并列三键（modelId/tpsText/isSubText 可空），活动时刻可空
+  assert.ok(
+    display.panel.rate.streams.every(
+      (s) => typeof s.modelId === "string" && typeof s.tpsText === "string" && (s.isSubText === null || typeof s.isSubText === "string"),
+    ),
+    "流并列字段类型齐（视图哑渲染绑定面）",
+  );
+  assert.ok(
+    display.panel.rate.lastActivityText === null || typeof display.panel.rate.lastActivityText === "string",
+    "活动时刻可空或字符串",
+  );
+  // 厂商行绑定字段：环百分比可空、环色 hex、状态句必有（低水位/紧张态文案已在 view-model 定稿）、副行可空
+  for (const v of display.panel.vendors) {
+    assert.ok(v.ringPct === null || typeof v.ringPct === "number", "ringPct 可空或数值");
+    assert.match(v.ringColor, /^#[0-9a-f]{6}$/i, "环色为 hex 色值（stroke-dasharray 环直渲）");
+    assert.equal(typeof v.statusText, "string", "状态句必有");
+    assert.ok(v.subText === null || typeof v.subText === "string", "副行可空或字符串");
+    assert.ok(
+      Array.isArray(v.percents) && v.percents.every((p) => typeof p.label === "string" && (p.pct === null || typeof p.pct === "number")),
+      "百分比枚举字段齐（OpenCode 三枚全量契约）",
+    );
+  }
+  // 趋势：24 点序号坐标 + foot 累计句（视图 SVG path 直接映射）
+  assert.equal(display.panel.trend.points.length, 24, "趋势 24 点");
+  assert.equal(typeof display.panel.trend.footText, "string", "趋势 foot 必有");
+  // 结论：keyless 无官方 percent 采样 → 诚实占位句（真实链路经 view-model 产出）
+  assert.equal(display.panel.conclusion.text, "消耗速度尚不足以推算");
 
   // ---- ⑥ 密钥零泄漏：快照与展示输出不含 apiKey 字样/键 ----
   assert.ok(!snapText.includes("apiKey"), "快照文件不得出现 apiKey 字样");

@@ -1,7 +1,9 @@
 /**
  * 看板交付面测试：manifest 扩展声明合规（修正后 schema + V2 slots 收敛/版本 bump）、
  * activate() 宿主接线（V2 素条链 + Task 6 增补：sync 资源/notify 句柄/会话作用域素条/订阅绑定降级）、
- * V2 展示模型纯函数（素条四态逐字/会话 focus 段/厂商行环色/趋势/结论的文案映射）。
+ * V2 展示模型纯函数（素条四态逐字/会话 focus 段/厂商行环色/趋势/结论的文案映射）、
+ * Task 7 视图形约（卡片面板单文件自包含：无外链/渲染锚点/动效降级/双通道取数——文案零断言，
+ * 数据文案已由 view-model 用例钉死，视图只哑渲染）。
  *
  * 背景：V1 view-model 映射用例随 charts 退役删除（Task 5，映射本体待 Task 8 清零）；
  * tick 60s 拍/节流/防重入用例属服务层契约，随 Task 4 落在 pipeline.test.mjs。宿主源码实证：
@@ -802,6 +804,62 @@ test("bindOnGenerate：ctx 顶层 subscribe 双签名——事件全名优先，
   };
   assert.equal(bindOnGenerate(ctxNone, handler, (l) => logs.push(l)), null);
   assert.ok(logs.length >= 2, "双签名两次失败均应留痕");
+});
+
+// ---------------------------------------------------------------------------
+// 五、视图形约（Task 7 卡片面板全量重写：单文件自包含哑渲染。文案零断言——数据文案
+//     已由上方 view-model 用例钉死，此处只钉视图侧形状/接线契约，重构视图不破文案用例）
+// ---------------------------------------------------------------------------
+
+/** 读取视图源文件（被测对象：extension/view/index.html 单文件自包含） */
+function readView() {
+  return readFileSync(new URL("../extension/view/index.html", import.meta.url), "utf8");
+}
+
+test("视图自包含：无外链 script、零外部 URL 引用；五渲染锚点 data-testid 齐", () => {
+  const html = readView();
+  // 宿主对 entry 形态视图只伺服 pageUri + 注册资源（V1 探针实证）：外链 script/字体必失败
+  assert.ok(!/<script[^>]*\bsrc=/i.test(html), "不得存在外链 script（宿主不伺服外部脚本）");
+  assert.ok(!/https?:\/\//i.test(html), "视图零外部 URL 引用（字体走本地栈、SVG 免 xmlns 外链形态）");
+  // 差异渲染与真机定位的稳定锚点：速率条/厂商行/趋势/同步按钮/结论句
+  for (const tid of ["rate-bar", "vendor-row", "trend-chart", "sync-btn", "conclusion-line"]) {
+    assert.ok(html.includes(`data-testid="${tid}"`), `缺少 data-testid="${tid}"`);
+  }
+});
+
+test("动效契约：数字节点挂 300ms 过渡类；prefers-reduced-motion 全关；仅呼吸圆点与同步旋转两枚功能动画", () => {
+  const html = readView();
+  // 数字变化 300ms 过渡：.num-t 类定义带 300ms transition，且数字节点实际挂类
+  assert.match(html, /\.num-t\s*\{[^}]*transition[^}]*\.3s/, "缺少 .num-t 数字过渡类（300ms）");
+  assert.match(html, /class="[^"]*num-t/, "数字节点须实际挂 num-t 类");
+  // 无障碍降级：媒体查询内动画与过渡全部关闭（简报动效契约）
+  assert.match(
+    html,
+    /@media\s*\(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*?animation:none[\s\S]*?transition:none/,
+    "prefers-reduced-motion 降级须同时关动画与过渡",
+  );
+  // 呼吸圆点必须为 CSS keyframes；装饰性动画零容忍——keyframes 白名单仅两枚功能动画
+  const kf = [...html.matchAll(/@keyframes\s+([\w-]+)\s*\{/g)].map((m) => m[1]);
+  assert.ok(kf.includes("breath"), "呼吸圆点必须为 CSS keyframes 动画");
+  assert.deepEqual(
+    [...new Set(kf)].sort(),
+    ["breath", "spin"],
+    "keyframes 白名单仅呼吸圆点/同步旋转（装饰性逐字滚动等动画禁令）: " + kf.join(","),
+  );
+});
+
+test("取数与同步接线：display/sync 双注册资源；订阅 typeof 探测静默 + 1s 轮询兜底；10s 超时复位 + 失败中文提示", () => {
+  const html = readView();
+  // 取数主通道 + 手动同步通道（注册资源 read 调用逐字 URI）
+  assert.ok(html.includes('readResource("zpowerpack://display")'), "取数主通道必须读 display 注册资源");
+  assert.ok(html.includes('readResource("zpowerpack://sync")'), "同步按钮必须读 sync 注册资源");
+  // 防御性双通道：订阅形态 typeof 探测（沙箱 window.zcode 暴露性真机校准点未证实）+ 轮询兜底常驻
+  assert.match(html, /typeof[^;]{0,80}subscribe/, "缺少订阅形态 typeof 探测");
+  assert.match(html, /POLL_FALLBACK_MS\s*=\s*1000/, "缺少 POLL_FALLBACK_MS=1000 轮询兜底常量");
+  // 同步按钮行为契约：拉取中禁用+旋转、10s 超时复位、失败文案逐字（视图侧唯一固定交互文案）
+  assert.match(html, /SYNC_TIMEOUT_MS\s*=\s*10000/, "缺少 SYNC_TIMEOUT_MS=10000 超时复位常量");
+  assert.match(html, /\.busy[^{]*\{[^}]*animation:\s*spin/, "拉取中旋转图标态缺失");
+  assert.ok(html.includes("同步失败：官方接口不可达"), "同步失败中文提示缺失（简报钉死文案）");
 });
 
 /**
