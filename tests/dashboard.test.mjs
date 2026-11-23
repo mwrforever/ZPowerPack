@@ -1,13 +1,17 @@
 /**
- * 看板交付面测试：manifest 扩展声明合规（修正后 schema）、activate() 宿主接线（V2 素条链）、
- * V2 展示模型纯函数（素条四态逐字/厂商行环色/趋势/结论的文案映射）。
+ * 看板交付面测试：manifest 扩展声明合规（修正后 schema + V2 slots 收敛/版本 bump）、
+ * activate() 宿主接线（V2 素条链 + Task 6 增补：sync 资源/notify 句柄/会话作用域素条/订阅绑定降级）、
+ * V2 展示模型纯函数（素条四态逐字/会话 focus 段/厂商行环色/趋势/结论的文案映射）。
  *
  * 背景：V1 view-model 映射用例随 charts 退役删除（Task 5，映射本体待 Task 8 清零）；
  * tick 60s 拍/节流/防重入用例属服务层契约，随 Task 4 落在 pipeline.test.mjs。宿主源码实证：
  * - engines.zcode 校验基准 = 扩展 API 版本 1.4.0（非应用版本）
- * - slots = plugin.json 顶层对象（slot id 做键），target 单键 {view|command: id}
+ * - slots = plugin.json 顶层对象（slot id 做键），target 单键 {view|command: id}；
+ *   slots.update 第三参=作用域（{sessionId}，2026-11-23 修订 #1）
  * - entry 形态视图宿主只伺服 pageUri + 注册资源 → 视图单文件自包含，文案映射上移 Node 侧
  * - composer 渲染组件不消费 badge → V2 素条推送不带 badge 字段
+ * - workbench.onDidChange（{sessions:[{sessionId,...,focused}]}）+ context.get({sessionId})
+ *   →{model:{providerId,...}}：聚焦会话感知与 tooltip 额度供应商（修订 #1/#2）
  */
 
 import { test } from "node:test";
@@ -16,7 +20,7 @@ import { readFileSync, existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { activate } from "../extension/main.js";
+import { activate, bindOnGenerate } from "../extension/main.js";
 import { toDisplayModelV2 } from "../extension/view-model.mjs";
 
 /** 读取插件 manifest（被测对象：仓库根 .zcode-plugin/plugin.json） */
@@ -59,9 +63,32 @@ test("manifest：slots 顶层对象形态，键在宿主词表内，条目 targe
         assert.ok(m.extension.contributes.commands.some((c) => c.id === id), `command 未声明: ${id}`);
     }
   }
-  // 看板入口在主导航；迷你条在会话状态区（锁定决策：位置 A/B）
-  assert.ok(Array.isArray(m.slots["nav.primary"]) && m.slots["nav.primary"].length === 1);
+  // V2 收敛（2026-11-23 反馈 #3）：nav.primary 砍除，素条为唯一入口；迷你条在会话状态区
+  assert.ok(!("nav.primary" in m.slots), "nav.primary 已随 V2 收敛删除（应用内无多余入口）");
   assert.ok(Array.isArray(m.slots["composer.status"]) && m.slots["composer.status"].length === 1);
+});
+
+test("manifest：slots 收敛 V2——仅 composer.status，条目 icon=gauge 且 target 指向已声明命令", () => {
+  const m = readManifest();
+  assert.deepEqual(Object.keys(m.slots), ["composer.status"], "唯一入口=素条（nav.primary/sidePane 均不保留）");
+  // 条目逐字（brief 定案）：icon 取宿主 23 词表内的 gauge；点击经命令打开看板
+  assert.deepEqual(m.slots["composer.status"], [
+    { id: "zpowerpack-mini", order: 1, icon: "gauge", title: "ZPowerPack 用量速览", target: { command: "zpowerpack-open-dashboard" } },
+  ]);
+  const cmdId = m.slots["composer.status"][0].target.command;
+  assert.ok(m.extension.contributes.commands.some((c) => c.id === cmdId), `command 未声明: ${cmdId}`);
+});
+
+test("manifest：版本 0.2.0（部署缓存按版本刷新）；description 为 V2 文案（实时速率/额度窗口/24h 趋势）", () => {
+  const m = readManifest();
+  // 部署机制（§六 2026-11-23 实证）：运行时加载安装时缓存副本，版本 bump 是缓存刷新的唯一触发
+  assert.equal(m.version, "0.2.0");
+  const d = m.description ?? "";
+  assert.ok(d.includes("实时 token 速率"), "V2 文案应宣称实时速率");
+  assert.ok(d.includes("额度窗口"), "V2 文案应宣称额度窗口");
+  assert.ok(/24h.*趋势/.test(d), "V2 文案应宣称 24h 趋势");
+  // V1 退役口径不得残留（速度/健康/时段统计随 charts 八报表退役）
+  assert.ok(!d.includes("速度/健康/时段"), "不得再宣称速度/健康/时段统计");
 });
 
 test("manifest：main 为插件根内相对路径（不得绝对/含 ..）", () => {
@@ -273,6 +300,56 @@ test("素条 tooltip ≤200：三窗口+重置+主子速率全量且不截断关
   assert.equal(toDisplayModelV2(emptyV2Snapshot(now), now).strip.tooltip, "ZPowerPack 用量速览 · 点击打开看板");
 });
 
+test("会话作用域素条：focus 段只取该会话流与聚焦供应商额度行；四态逐字；全局流不串扰", () => {
+  const now = 1732252927000;
+  const base = makeV2Snapshot(now);
+  // 全局流含另一会话的请求（req-2）：素条必须按 focus.streams 过滤，不得把别会话速率算进来
+  base.rate.streams.push({ requestId: "req-2", modelId: "glm-4.7", providerId: "bigmodel-api", isSub: false, tps: 500, phase: "streaming" });
+  base.rate.totalTps = 928;
+  const zhipu = base.quota[0];
+  const kimi = base.quota[1];
+
+  // 态① 会话生成中·仅主代理：速率=该会话流合计（428），水位=聚焦会话模型选择供应商首窗口
+  const live = { ...base, focus: { sessionId: "sA", modelId: "glm-4.7", providerId: "bigmodel-api", quotaRow: zhipu, streams: base.rate.streams.slice(0, 1) } };
+  const dm1 = toDisplayModelV2(live, now);
+  assert.equal(dm1.strip.text, "428 tok/s · 5h 73%");
+  assert.equal(dm1.strip.tooltip, "智谱 5h 73%（2h12m 后重置）· 周 41% · 主 428 tok/s · 点击查看详情");
+  // 面板速率条仍为全局口径（focus 只作用于素条，面板四区不收窄）
+  assert.equal(dm1.panel.rate.totalText, "928 tok/s");
+  assert.equal(dm1.panel.rate.streams.length, 2);
+
+  // 态② 会话内主+子并行：合计形态「主+子」+ 并行路数
+  const parallel = { ...base, focus: { sessionId: "sA", modelId: null, providerId: "bigmodel-api", quotaRow: zhipu, streams: [
+    base.rate.streams[0],
+    { requestId: "req-3", modelId: "kimi-k2", providerId: "kimi-code-cn", isSub: true, tps: 96, phase: "streaming" },
+  ] } };
+  const dm2 = toDisplayModelV2(parallel, now);
+  assert.equal(dm2.strip.text, "428+96 tok/s · 5h 73%");
+  assert.ok(dm2.strip.tooltip.includes("主 428 · 子 96 tok/s（2 路并行）"), "会话内主子速率全量: " + dm2.strip.tooltip);
+
+  // 态③ 会话空闲：跟随聚焦会话当前模型选择供应商（tooltip 额度=修订 #2，Kimi 行）
+  const idle = { ...base, focus: { sessionId: "sA", modelId: "kimi-k2", providerId: "kimi-code-cn", quotaRow: kimi, streams: [] } };
+  const dm3 = toDisplayModelV2(idle, now);
+  assert.equal(dm3.strip.text, "Kimi 5h 12% · 月 27%");
+  assert.ok(dm3.strip.tooltip.startsWith("Kimi 5h 12%"), "tooltip 额度头取聚焦供应商: " + dm3.strip.tooltip);
+  assert.ok(dm3.strip.tooltip.endsWith("点击查看详情"));
+
+  // 态④ 会话无数据：context 组合为 null 且该会话无事件 → 无供应商可跟 → 待机
+  const none = { ...base, focus: { sessionId: "sA", modelId: null, providerId: null, quotaRow: null, streams: [] } };
+  const dm4 = toDisplayModelV2(none, now);
+  assert.equal(dm4.strip.text, "ZPowerPack 待机");
+  assert.equal(dm4.strip.tooltip, "ZPowerPack 用量速览 · 点击打开看板");
+
+  // 会话生成中但聚焦供应商无额度配置：只给速率，不编造水位（tooltip 无额度头）
+  const noQuota = { ...base, focus: { sessionId: "sA", modelId: null, providerId: "opencode-go", quotaRow: null, streams: base.rate.streams.slice(0, 1) } };
+  const dm5 = toDisplayModelV2(noQuota, now);
+  assert.equal(dm5.strip.text, "428 tok/s");
+  assert.equal(dm5.strip.tooltip, "主 428 tok/s · 点击查看详情");
+
+  // focus 缺省 → 全局口径回退（行为与 V2 首版一致，既有用例全数保留）
+  assert.equal(toDisplayModelV2(base, now).strip.text, "928 tok/s · 5h 73%");
+});
+
 test("厂商行：环色 60/85 双阈值；状态句相对/绝对两态；percents 枚举全部窗口（OpenCode 三枚）", () => {
   const now = 1732252927000;
   const dm = toDisplayModelV2(makeV2Snapshot(now), now);
@@ -357,7 +434,7 @@ test("界面文案禁 P50/P95（沿用护栏）", () => {
 // 三、activate() 宿主接线（V2）：注册视图（entry+注册资源）、命令、素条推送；快照文件兜底保留
 // ---------------------------------------------------------------------------
 
-/** 构造 mock ctx：记录 views/commands/slots 调用，模拟宿主注册表 */
+/** 构造 mock ctx：记录 views/commands/slots 调用，模拟宿主注册表（slots 记录含作用域第三参） */
 function makeMockCtx() {
   const calls = { views: [], commands: [], slots: [], opened: [] };
   return {
@@ -367,7 +444,8 @@ function makeMockCtx() {
       open: (id) => calls.opened.push(id),
     },
     commands: { register: (id, fn) => calls.commands.push({ id, fn }) },
-    slots: { update: (id, patch) => calls.slots.push({ id, patch }) },
+    // 会话作用域素条（2026-11-23 修订 #1）：第三参=作用域（{sessionId}），单测断言其形态传递
+    slots: { update: (id, patch, scope) => calls.slots.push({ id, patch, scope }) },
   };
 }
 
@@ -398,7 +476,7 @@ function fakeDeps() {
   };
 }
 
-test("activate：注册看板视图（entry 相对插件根）+ display/snapshot 两个注册资源，空态 display 可读", async () => {
+test("activate：注册看板视图（entry 相对插件根）+ display/snapshot/sync 三个注册资源，空态 display 可读", async () => {
   const ctx = makeMockCtx();
   const stop = await runActivateOnce(ctx);
   try {
@@ -407,7 +485,7 @@ test("activate：注册看板视图（entry 相对插件根）+ display/snapshot
     assert.equal(id, "zpowerpack-dashboard");
     assert.equal(def.entry, "extension/view/index.html", "entry 相对插件根解析（探针 ENOENT 教训）");
     assert.equal(typeof def.onDidOpen, "function");
-    // 注册资源：display 供视图取数（V2 展示模型 {strip, panel}），snapshot 供调试
+    // 注册资源：display 供视图取数（V2 展示模型 {strip, panel}），snapshot 供调试，sync 供手动即时拉取
     const display = def.resources["zpowerpack://display"];
     assert.ok(display, "缺少 zpowerpack://display 注册资源");
     assert.equal(display.mimeType, "application/json");
@@ -416,6 +494,8 @@ test("activate：注册看板视图（entry 相对插件根）+ display/snapshot
     // 无事件无额度 → 素条空态（V2 展示模型形状）
     assert.equal(parsed.strip.text, "ZPowerPack 待机");
     assert.ok(def.resources["zpowerpack://snapshot"], "保留原始快照资源（调试通道）");
+    assert.ok(def.resources["zpowerpack://sync"], "缺少 zpowerpack://sync 手动同步资源");
+    assert.equal(def.resources["zpowerpack://sync"].mimeType, "application/json");
     // onDidOpen 消费宿主句柄入参不抛（临时：Task 0 采集段的记录函数在注入 deps 路径判空直跳）
     assert.doesNotThrow(() => def.onDidOpen({ view: {}, notify: () => {} }));
   } finally {
@@ -477,15 +557,251 @@ test("activate：快照文件兜底保留；稳态素条不重复推送；生成
       },
       1732252927100,
     );
-    const slotCalls = ctx.calls.slots.filter((s) => s.id === "zpowerpack-mini");
-    const patch = slotCalls[slotCalls.length - 1].patch;
-    assert.equal(patch.text, "428 tok/s", "live 单流素条=速率合计（无额度水位段不编造）");
     const snap2 = JSON.parse(readFileSync(snapshotPath, "utf8"));
     assert.equal(snap2.rate.state, "live", "事件型 deliver 同步刷新快照文件");
     assert.equal(snap2.rate.totalTps, 428);
+    // 素条推送经 context.get 异步排程（会话作用域通道），等一拍微任务落地后再断言
+    await new Promise((r) => setTimeout(r, 30));
+    const slotCalls = ctx.calls.slots.filter((s) => s.id === "zpowerpack-mini");
+    const patch = slotCalls[slotCalls.length - 1].patch;
+    assert.equal(patch.text, "428 tok/s", "live 单流素条=速率合计（无额度水位段不编造）");
   } finally {
     handle.stop();
   }
+});
+
+test("activate：sync 资源 read 触发一次即时额度拉取并返回 quota（quotaPending 绕过 60s TTL）", async () => {
+  const ctx = makeMockCtx();
+  const now = 1732252927000;
+  let quotaPulls = 0;
+  const deps = {
+    ...fakeDeps(),
+    // 固定时钟：60s TTL 永不过期 → 即时拉取只能来自 sync 的 quotaPending 通道
+    fetchQuota: async () => {
+      quotaPulls++;
+      return [];
+    },
+    now: () => now,
+  };
+  const handle = await activate(ctx, { intervalMs: 5, deps });
+  try {
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(quotaPulls, 1, "固定时钟下 TTL 内只有首拍拉一次");
+    handle.stop(); // 停拍隔离：后续拉取只能来自 sync read 触发的即时拍
+    await new Promise((r) => setTimeout(r, 10));
+    const sync = ctx.calls.views[0].def.resources["zpowerpack://sync"];
+    const parsed = JSON.parse(await sync.read({ view: {} }));
+    assert.deepEqual(Object.keys(parsed), ["quota"], "sync 返回 {quota} 载荷");
+    assert.deepEqual(parsed.quota, []);
+    assert.equal(quotaPulls, 2, "sync read 置待办并立即跑一拍（绕过 TTL 重拉额度）");
+  } finally {
+    handle.stop();
+  }
+});
+
+test("activate：onDidOpen 保存 notify 句柄，数据更新时 notify(display)；onDidClose 清引用后不再推送", async () => {
+  const ctx = makeMockCtx();
+  const deps = { ...fakeDeps(), now: () => 1732252927000 };
+  const handle = await activate(ctx, { intervalMs: 5, deps });
+  try {
+    const notifyCalls = [];
+    let closeCb = null;
+    // 模拟宿主打开视图：句柄带 notify(uri) 与 onDidClose(cb)（推送链 §五.8 实证形状）
+    ctx.calls.views[0].def.onDidOpen({ notify: (uri) => notifyCalls.push(uri), onDidClose: (cb) => (closeCb = cb) });
+    await new Promise((r) => setTimeout(r, 40));
+    // tick deliver → 已打开的视图收到 display 更新通知（重读注册资源）
+    assert.ok(notifyCalls.length >= 1, "视图打开后应至少收到一次 display 通知");
+    assert.ok(notifyCalls.every((u) => u === "zpowerpack://display"), "通知 uri 固定为 display");
+    // 关闭视图：宿主回调清引用 → 后续数据更新不再向已关闭视图推送
+    closeCb();
+    const countAtClose = notifyCalls.length;
+    handle.onGenerateEvent(
+      { sessionId: "s1", requestId: "r1", model: { providerId: "bigmodel-api", modelId: "glm-4.7" }, phase: "streaming", outputTokensPerSecond: 200 },
+      1732252927100,
+    );
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(notifyCalls.length, countAtClose, "视图关闭后不得再收到通知");
+  } finally {
+    handle.stop();
+  }
+});
+
+test("activate：素条按会话分别推送——workbench 可见会话各得本会话值，slots.update 第三参传 {sessionId}", async () => {
+  const ctx = makeMockCtx();
+  const now = 1732252927000;
+  // workbench 模拟（宿主实证形状）：两窗口两会话，sA 聚焦；初值经 visibleSessions 拉取
+  ctx.workbench = {
+    onDidChange: () => {},
+    visibleSessions: async () => ({
+      sessions: [
+        { sessionId: "sA", workspace: "E:\\w1", isDraft: false, focused: true },
+        { sessionId: "sB", workspace: "E:\\w2", isDraft: false, focused: false },
+      ],
+    }),
+  };
+  // context.get 模拟（宿主实证）：sA 已选模型 → 供应商 bigmodel-api；sB 新会话未发首条 → null 走回退
+  ctx.context = {
+    get: async ({ sessionId }) => (sessionId === "sA" ? { model: { providerId: "bigmodel-api", modelId: "glm-4.7", contextWindow: 128000 } } : null),
+  };
+  const zhipuRow = {
+    providerId: "bigmodel-api",
+    name: "智谱",
+    windows: [
+      { type: "rolling-5h", percent: 73, used: 9.1e6, limit: 2.0e7, source: "official", nextResetMs: now + 7920000 },
+      { type: "weekly", percent: 41, used: 2.4e7, limit: 2.0e8, source: "official", nextResetMs: now + 187200000 },
+    ],
+    nextResetMs: now + 7920000,
+    percent: 73,
+    source: "official",
+  };
+  const deps = { ...fakeDeps(), fetchQuota: async () => [zhipuRow], now: () => now };
+  const handle = await activate(ctx, { intervalMs: 5, deps });
+  try {
+    await new Promise((r) => setTimeout(r, 80));
+    const mini = (sid) => ctx.calls.slots.filter((s) => s.id === "zpowerpack-mini" && s.scope?.sessionId === sid);
+    // sA 空闲：context 模型选择 → 智谱额度行 → 水位文案（tooltip 额度=聚焦会话当前模型选择供应商）
+    const a = mini("sA");
+    assert.ok(a.length >= 1, "sA 应收到会话作用域素条");
+    assert.equal(a[a.length - 1].patch.text, "智谱 5h 73% · 周 41%");
+    // 重置文案随真实渲染时刻走绝对/相对两态，断言骨架不绑时钟
+    assert.match(a[a.length - 1].patch.tooltip, /^智谱 5h 73%（.+）· 周 41% · 点击查看详情$/);
+    // sB 空闲：组合上下文 null 且该会话无事件 → 待机
+    const b = mini("sB");
+    assert.ok(b.length >= 1, "sB 应收到会话作用域素条");
+    assert.equal(b[b.length - 1].patch.text, "ZPowerPack 待机");
+    // V2 素条不推 badge（渲染侧从不消费）
+    assert.ok(ctx.calls.slots.every((s) => !("badge" in s.patch)));
+
+    // sA 发起生成：事件按 sessionId 归入该会话 → sA 素条点亮速率，sB 不受串扰
+    handle.onGenerateEvent(
+      { sessionId: "sA", requestId: "req-a", model: { providerId: "kimi-code-cn", modelId: "kimi-k2" }, phase: "streaming", outputTokensPerSecond: 300 },
+      now + 2000,
+    );
+    await new Promise((r) => setTimeout(r, 40));
+    const a2 = mini("sA");
+    assert.equal(a2[a2.length - 1].patch.text, "300 tok/s · 5h 73%", "会话生成中=该会话流速率+聚焦供应商水位");
+    assert.ok(a2[a2.length - 1].patch.tooltip.includes("主 300 tok/s"), "tooltip 速率段取该会话流: " + a2[a2.length - 1].patch.tooltip);
+    assert.equal(mini("sB")[mini("sB").length - 1].patch.text, "ZPowerPack 待机", "他会有事件不串扰本会话素条");
+
+    // 同值去重：稳态（无新事件）下同会话素条推送计数不增长
+    const before = mini("sA").length;
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(mini("sA").length, before, "同会话同值不重复推送");
+  } finally {
+    handle.stop();
+  }
+});
+
+test("activate：workbench 不可达降级——素条推给最近事件会话（无事件时全局待机）；订阅绑定全败仅中文 warn", async () => {
+  const ctx = makeMockCtx(); // 无 workbench/context/models：三条宿主面全降级
+  const logs = [];
+  const deps = { ...fakeDeps(), now: () => 1732252927000 };
+  const handle = await activate(ctx, { intervalMs: 5, deps, log: (l) => logs.push(l) });
+  try {
+    await new Promise((r) => setTimeout(r, 50));
+    // 无事件 → 无会话可指：全局素条（待机）兜底可见（刚装形态）
+    const unscoped = ctx.calls.slots.filter((s) => s.id === "zpowerpack-mini" && s.scope === undefined);
+    assert.ok(unscoped.length >= 1, "降级初期应推全局素条");
+    assert.equal(unscoped[unscoped.length - 1].patch.text, "ZPowerPack 待机");
+    // 降级留痕：workbench 与生成事件订阅均中文 warn（激活不失败，兜底行接管速率）
+    assert.ok(logs.some((l) => l.includes("workbench") && l.includes("不可达")), "workbench 降级需日志标注: " + logs.join("|"));
+    assert.ok(logs.some((l) => l.includes("生成事件订阅不可达")), "订阅绑定全败需中文 warn");
+    // 事件到达 → 降级对象=最近有事件的会话，素条作用域推给该会话
+    handle.onGenerateEvent(
+      { sessionId: "sX", requestId: "rX", model: { providerId: "bigmodel-api", modelId: "glm-4.7" }, phase: "streaming", outputTokensPerSecond: 250 },
+      1732252927100,
+    );
+    await new Promise((r) => setTimeout(r, 40));
+    const scoped = ctx.calls.slots.filter((s) => s.id === "zpowerpack-mini" && s.scope?.sessionId === "sX");
+    assert.ok(scoped.length >= 1, "降级后事件会话应收到作用域素条");
+    assert.equal(scoped[scoped.length - 1].patch.text, "250 tok/s", "无额度数据只给速率，不编造水位");
+  } finally {
+    handle.stop();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 四、bindOnGenerate 订阅绑定（Task 6 接线：候选序列与临时探测段一致，先成功者胜）
+// ---------------------------------------------------------------------------
+
+test("bindOnGenerate：候选序列先成功者胜——函数直挂优先，后续形态不再尝试（防事件双计）", () => {
+  const tried = [];
+  const handler = () => {};
+  const ctx = {
+    models: {
+      onDidGenerate: (cb) => {
+        tried.push("direct");
+        return () => {};
+      },
+      subscribe: (topic, cb) => {
+        tried.push("models.subscribe");
+        return {};
+      },
+    },
+    subscribe: (topic, cb) => {
+      tried.push("ctx.subscribe:" + topic);
+      return {};
+    },
+  };
+  assert.equal(bindOnGenerate(ctx, handler, () => {}), "ctx.models.onDidGenerate()");
+  assert.deepEqual(tried, ["direct"], "任一形态绑定成功即停（同一事件重复订阅会双计速率）");
+});
+
+test("bindOnGenerate：函数直挂抛错 → 逐候选降级到 models.subscribe 通用入口", () => {
+  const handler = () => {};
+  const ctx = {
+    models: {
+      onDidGenerate: () => {
+        throw new Error("宿主拒绝直挂");
+      },
+      subscribe: (topic) => {
+        assert.equal(topic, "onDidGenerate", "通用入口的事件名应为短名 onDidGenerate");
+      },
+    },
+  };
+  const logs = [];
+  assert.equal(bindOnGenerate(ctx, handler, (l) => logs.push(l)), 'ctx.models.subscribe("onDidGenerate", cb)');
+  assert.ok(logs.some((l) => l.includes("绑定失败")), "失败候选需中文日志: " + logs.join("|"));
+});
+
+test("bindOnGenerate：subscribe 对象形态（Rx 风格）在函数缺位时接住", () => {
+  const bound = [];
+  const ctx = { models: { onDidGenerate: { subscribe: (cb) => bound.push(cb) } } };
+  const handler = () => {};
+  assert.equal(bindOnGenerate(ctx, handler, () => {}), "ctx.models.onDidGenerate.subscribe()");
+  assert.equal(bound[0], handler, "订阅回调必须是传入的事件处理函数");
+});
+
+test("bindOnGenerate：ctx 顶层 subscribe 双签名——事件全名优先，短名次之，全败返回 null", () => {
+  const handler = () => {};
+  // 全名成功 → 短名不试
+  const topics = [];
+  const ctxFull = {
+    subscribe: (topic, cb) => {
+      topics.push(topic);
+      if (topic === "models.onDidGenerate") return {};
+      throw new Error("未知事件");
+    },
+  };
+  assert.equal(bindOnGenerate(ctxFull, handler, () => {}), 'ctx.subscribe("models.onDidGenerate", cb)');
+  assert.deepEqual(topics, ["models.onDidGenerate"]);
+  // 全名失败 → 短名接住
+  const ctxShort = {
+    subscribe: (topic) => {
+      if (topic === "onDidGenerate") return {};
+      throw new Error("x");
+    },
+  };
+  assert.equal(bindOnGenerate(ctxShort, handler, () => {}), 'ctx.subscribe("onDidGenerate", cb)');
+  // 全部候选失败 → null（调用方据此记中文 warn，tickV2 兜底行接管速率）
+  const logs = [];
+  const ctxNone = {
+    subscribe: () => {
+      throw new Error("宿主无订阅面");
+    },
+  };
+  assert.equal(bindOnGenerate(ctxNone, handler, (l) => logs.push(l)), null);
+  assert.ok(logs.length >= 2, "双签名两次失败均应留痕");
 });
 
 /**

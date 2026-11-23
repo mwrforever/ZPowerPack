@@ -1,7 +1,7 @@
 {
   "name": "zpowerpack",
-  "version": "0.1.0",
-  "description": "ZPowerPack：zcode 存储迁移向导与用量看板——实时 token 速率、套餐额度窗口、速度/健康/时段统计，桌面端原生内嵌展示。",
+  "version": "0.2.0",
+  "description": "ZPowerPack：zcode 存储迁移向导与用量看板——实时 token 速率、套餐额度窗口与 24h 消耗趋势，桌面端原生内嵌展示。",
   "author": { "name": "ZPowerPack" },
   "license": "MIT",
   "skills": "skills",
@@ -19,11 +19,8 @@
     }
   },
   "slots": {
-    "nav.primary": [
-      { "id": "zpowerpack-nav", "order": 1, "icon": "activity", "title": "ZPowerPack 看板", "target": { "view": "zpowerpack-dashboard" } }
-    ],
     "composer.status": [
-      { "id": "zpowerpack-mini", "order": 1, "title": "用量速览", "target": { "command": "zpowerpack-open-dashboard" } }
+      { "id": "zpowerpack-mini", "order": 1, "icon": "gauge", "title": "ZPowerPack 用量速览", "target": { "command": "zpowerpack-open-dashboard" } }
     ]
   }
 }

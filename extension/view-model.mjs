@@ -375,8 +375,9 @@ function remainText(remainMs) {
 }
 
 /**
- * 素条/面板共同跟随的焦点厂商额度：快照 rate.lastProviderId → quota 同名实例。
- * 设计定案：生成中的水位段与空闲态都跟随「最近请求厂商」，厂商名优先用 quota.name。
+ * 素条全局口径的焦点厂商额度：快照 rate.lastProviderId → quota 同名实例。
+ * 会话作用域素条（修订 #1/#2）由 snap.focus 段接管，本函数仅服务 focus 缺省的全局/
+ * 降级形态——生成中的水位段与空闲态跟随「最近请求厂商」，厂商名优先用 quota.name。
  * @param {object} snap Task 4 buildSnapshotV2 产物
  * @returns {object|null} 焦点实例的 quota 行；无最近请求或实例无额度配置返回 null
  */
@@ -417,19 +418,38 @@ function quotaHeadOf(focus, now) {
 /**
  * 素条四态（设计 §五.6 表格逐字；composer.status 插槽契约 text≤40 / tooltip≤200）：
  * ① 生成中·仅主代理「428 tok/s · 5h 73%」；② 主+子并行「428+96 tok/s · 5h 73%」（素条取合计）；
- * ③ 空闲「智谱 5h 73% · 周 41%」（跟随最近请求厂商，首两个有百分比的窗口）；
+ * ③ 空闲「智谱 5h 73% · 周 41%」（首两个有百分比的窗口）；
  * ④ 无数据「ZPowerPack 待机」（刚装/未配 provider/尚无请求）。
  * tooltip：①②③=焦点厂商全窗口额度头 + 主子速率段 + 点击引导；④=固定引导文案。
- * @param {object} snap Task 4 buildSnapshotV2 产物
+ *
+ * 取值口径二选一（2026-11-23 修订 #1/#2）：
+ * - snap.focus 在位（会话作用域）：流=该会话的流（activate 按 events sessionId 过滤后的列表）、
+ *   额度=该会话当前模型选择供应商的 quota 行（组合上下文 null 时由 activate 回退最近请求供应商）；
+ * - focus 缺省（全局口径）：流=快照全量流、额度跟随最近请求厂商——与 V2 首版行为一致。
+ * @param {object} snap Task 4 buildSnapshotV2 产物（可携带 activate 组装的 focus 段）
  * @param {number} now 渲染时刻
  * @returns {{text: string, tooltip: string}}
  */
 function stripOf(snap, now) {
-  const rate = snap?.rate ?? {};
-  const streams = Array.isArray(rate.streams) ? rate.streams : [];
-  const focus = focusQuotaOf(snap);
+  const seg = snap?.focus ?? null;
+  if (seg) {
+    // 会话作用域：流与额度行已由 activate 按会话备好，这里只做文案映射（纯函数可 TDD）
+    return stripOfSegments(Array.isArray(seg.streams) ? seg.streams : [], seg.quotaRow ?? null, now);
+  }
+  // 全局口径：有流即 live（live-rate snapshot 契约保证 state=live ⟺ streams 非空，双重判定冗余保留）
+  const streams = Array.isArray(snap?.rate?.streams) ? snap.rate.streams : [];
+  return stripOfSegments(snap?.rate?.state === "live" ? streams : [], focusQuotaOf(snap), now);
+}
 
-  if (rate.state === "live" && streams.length > 0) {
+/**
+ * 素条四态文案（流列表 + 焦点额度行 → text/tooltip；素条与 tooltip 的唯一取值逻辑）。
+ * @param {object[]} streams 本口径下的活跃流（live 判定=列表非空）
+ * @param {object|null} focus 焦点额度行（水位段与 tooltip 额度头的唯一来源；null=无额度数据不编造）
+ * @param {number} now 渲染时刻
+ * @returns {{text: string, tooltip: string}}
+ */
+function stripOfSegments(streams, focus, now) {
+  if (streams.length > 0) {
     // 主/子速率合计：素条唯一实时数字，fmt1 一位小数去尾零（428.6→428.6、300→300）
     const mainTps = streams.reduce((s, x) => (x?.isSub ? s : s + (x?.tps ?? 0)), 0);
     const subTps = streams.reduce((s, x) => (x?.isSub ? s + (x?.tps ?? 0) : s), 0);
@@ -445,7 +465,7 @@ function stripOf(snap, now) {
     return { text, tooltip };
   }
 
-  // ④ 无数据：无最近请求厂商可跟随 → 待机（刚装/未配 provider）
+  // ④ 无数据：无焦点额度行可跟 → 待机（刚装/未配 provider/该会话尚无请求）
   if (focus === null) return { text: "ZPowerPack 待机", tooltip: "ZPowerPack 用量速览 · 点击打开看板" };
 
   // ③ 空闲（含 recent：非生成中一律走水位文案）：首两个有百分比的窗口（≤40 字符约束）
@@ -589,7 +609,10 @@ function conclusionOf(conclusion) {
 /**
  * V2 快照 → 展示模型（唯一入口）：素条四态（composer.status 承载，宿主渲染无样式自由度）
  * + 面板四区（速率条/厂商行/趋势/结论）。全部输出为可直接 innerText/样式绑定的值。
- * @param {object} snap Task 4 buildSnapshotV2 产物（{generatedAt, rate, quota, trend, conclusion}）
+ * snap.focus 为可选段（2026-11-23 修订 #1/#2，activate 按「聚焦会话」组装）：
+ * {sessionId, modelId, providerId, quotaRow, streams}——在位时素条只取该段（该会话的流
+ * 与该会话当前模型选择供应商的额度行），面板四区仍走全局快照（打开视图的会话归属归 T7）。
+ * @param {object} snap Task 4 buildSnapshotV2 产物（{generatedAt, rate, quota, trend, conclusion, focus?}）
  * @param {number} now 当前时刻（渲染时刻）
  * @returns {object} {strip: {text, tooltip}, panel: {rate, vendors, trend, conclusion}}
  */

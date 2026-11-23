@@ -3,15 +3,19 @@
  *
  * 架构（V2 重设计定案，docs/superpowers/specs/2026-11-22-zpowerpack-dashboard-v2-design.md）：
  * - 实时速率：官方 models.onDidGenerate 流式事件直录（live-rate 状态机），无 EMA/无窗口加权/
- *   无三态保持——展示值=官方推送值原样；订阅绑定由 Task 6 接线，本模块产出事件入口；
+ *   无三态保持——展示值=官方推送值原样；订阅绑定由本模块 bindOnGenerate 接线（候选形态
+ *   先成功者胜，全败降级兜底链）；素条按会话作用域推送（2026-11-23 修订 #1：workbench
+ *   感知可见会话 + events 的 sessionId 过滤，slots.update 第三参 {sessionId}）；
  * - 聚合层：db 只做 60s rowid 增量拉取落小时桶（hourly.mjs），激活首拍有界回填近 24h
  *   （禁 V1 游标 0 全量拉 8 万行的卡顿事故重演）；24h 趋势与 5h 额度兜底分子同源小时桶，
  *   任何时刻不重扫全量缓冲；charts 八报表全量计算退役；
- * - 额度层：官方接口 60s 一拉（TTL 缓存 + quotaPending 手动同步待办，Task 6 的 sync 资源置位）；
- *   本地分子兜底收窄至 5h 窗口（§五.3 裁量），周/月官方失败只出状态句；
+ * - 额度层：官方接口 60s 一拉（TTL 缓存 + quotaPending 手动同步待办，sync 注册资源置位即拉）；
+ *   本地分子兜底收窄至 5h 窗口（§五.3 裁量），周/月官方失败只出状态句；tooltip 额度跟随
+ *   聚焦会话当前模型选择的供应商（修订 #2：context.get，null 回退该会话最近请求供应商）；
  * - 快照契约 buildSnapshotV2：{generatedAt, rate, quota, trend, conclusion}，序列化安全无密钥
  *   （apiKey 只在额度请求头内出现，永不进入数据流）；
- * - 快照文件（<cliStorageRoot>/zpowerpack/last-snapshot.json 原子写）保留为兜底通道。
+ * - 快照文件（<cliStorageRoot>/zpowerpack/last-snapshot.json 原子写）保留为兜底通道；
+ *   视图推送链（§五.8）：onDidOpen 存 notify 句柄，数据更新一律 notify display。
  * 运行环境 = 扩展宿主 Node 进程，单线程事件循环（状态无并发风险，防重入护栏防定时器叠加）。
  */
 
@@ -349,8 +353,9 @@ function writeSnapshotFile(path, snapshot) {
  * 启动轮询服务（扩展激活入口调用；测试经 intervalMs 注入短间隔覆盖 60s 节奏）。
  * @param {{intervalMs?: number, deliver?: Function, snapshotPath?: string, log?: Function,
  *          deps?: object}} opts deps 缺省时绑定真实数据源（db-reader/额度引擎）
- * @returns {{stop: Function, onGenerateEvent: Function}} stop 供停用；
- *          onGenerateEvent 供 Task 6 绑定宿主 models.onDidGenerate 订阅
+ * @returns {{stop: Function, onGenerateEvent: Function, syncQuota: Function}} stop 供停用；
+ *          onGenerateEvent 供 Task 6 绑定宿主 models.onDidGenerate 订阅；
+ *          syncQuota 供 sync 注册资源 read 回调即时拉取额度（quotaPending 绕过 TTL 即拉）
  */
 export function start(opts = {}) {
   const intervalMs = opts.intervalMs ?? TICK_MS;
@@ -360,19 +365,30 @@ export function start(opts = {}) {
   // 防重入护栏（V1 根因教训）：上一轮（HTTP/慢查询）未完成时跳过本拍——
   // 避免 setInterval 叠加并发拉取拖垮宿主与网络栈
   let running = false;
-  const runTick = () => {
-    if (running) return;
+  /**
+   * 立即跑一拍并返回本轮 Promise；已有拍在飞时跳过（返回已决议 Promise）——
+   * syncQuota 的即时性由 quotaPending 兜底：在飞拍掠过额度步时待办保留给下一拍。
+   */
+  const runTickNow = () => {
+    if (running) return Promise.resolve();
     running = true;
-    void tickV2(state, { ...deps, deliver: opts.deliver, snapshotPath: opts.snapshotPath, log }).finally(() => {
+    return tickV2(state, { ...deps, deliver: opts.deliver, snapshotPath: opts.snapshotPath, log }).finally(() => {
       running = false;
     });
   };
-  const timer = setInterval(runTick, intervalMs);
+  const timer = setInterval(() => {
+    void runTickNow();
+  }, intervalMs);
   // 立即跑第一轮（首拍回填），避免首屏等一个间隔
-  runTick();
+  void runTickNow();
   return {
     stop: () => clearInterval(timer),
     onGenerateEvent: createOnGenerateEvent(state, { deliver: opts.deliver, snapshotPath: opts.snapshotPath, log }),
+    // 手动同步通道（Task 6 sync 资源接线）：置待办绕过 60s TTL，立即跑一拍送达
+    syncQuota: async () => {
+      state.quotaPending = true;
+      await runTickNow();
+    },
   };
 }
 
@@ -456,7 +472,7 @@ export async function computeQuota(providerDoc, now, buckets, log) {
 /** 真实数据源绑定（扩展宿主内运行；路径解析与迁移向导共用 config.mjs 规则） */
 function realDeps(log) {
   const homedir = os.homedir();
-  // 经共享单例打开（临时：Task 0 采集段与本函数共用同一只读连接，避免重复 openDb；T6 随采集段还原为直接 openDb）
+  // 经共享单例打开（临时：Task 0 采集段与本函数共用同一只读连接，避免重复 openDb；T8 随采集段还原为直接 openDb）
   const opened = sharedOpenDb(homedir);
   if (!opened.db) log("[看板] 未找到官方遥测库（db.sqlite），看板将显示空态");
   // provider 文档读入内存一次，apiKey 仅在额度请求头内即时引用，绝不进入快照/日志
@@ -494,17 +510,80 @@ const EMPTY_DISPLAY = toDisplayModelV2(
 );
 
 /**
- * 扩展激活入口：注册看板视图（entry + 注册资源）、素条命令、启动 60s 拍与事件入口。
+ * 生成事件订阅绑定（Task 6 接线）：宿主 ctx 的订阅挂载形态未定案（Task 0 真机采集在途），
+ * 按临时探测段的候选序列逐一尝试、先绑定成功者胜——同一事件重复订阅会双计速率，任一
+ * 形态成功即停。序列与 probeSubscribeCandidates 一致：models.onDidGenerate 函数直挂 →
+ * 同名 .subscribe 对象（互斥）→ models.subscribe 通用入口 → ctx 顶层 subscribe（全名/短名双猜）。
+ * @param {object} ctx 扩展上下文（宿主 activate 入参，可能不含 models 命名空间）
+ * @param {Function} handler 事件处理函数（activate 的会话追踪包装后入口）
+ * @param {Function} log 日志（中文；每个失败候选留痕，供真机诊断对照）
+ * @returns {string|null} 绑定成功的形态标签；null=全部候选失败（订阅不可达，速率由
+ *          tickV2 兜底行接管，激活不失败——由调用方记中文 warn）
+ */
+export function bindOnGenerate(ctx, handler, log = () => {}) {
+  const models = ctx?.models;
+  // 候选 1/2：ctx.models.onDidGenerate——函数（调用即订阅）或带 subscribe 方法的对象（Rx 风格），二者互斥
+  if (typeof models?.onDidGenerate === "function") {
+    try {
+      models.onDidGenerate(handler);
+      return "ctx.models.onDidGenerate()";
+    } catch (e) {
+      log(`[ZPowerPack] 订阅形态 ctx.models.onDidGenerate() 绑定失败：${e?.message ?? ""}`);
+    }
+  } else if (models?.onDidGenerate && typeof models.onDidGenerate.subscribe === "function") {
+    try {
+      models.onDidGenerate.subscribe(handler);
+      return "ctx.models.onDidGenerate.subscribe()";
+    } catch (e) {
+      log(`[ZPowerPack] 订阅形态 ctx.models.onDidGenerate.subscribe() 绑定失败：${e?.message ?? ""}`);
+    }
+  }
+  // 候选 3：models 命名空间上的通用 subscribe 入口（backend:"pump" 的统一通道可能形态）
+  if (typeof models?.subscribe === "function") {
+    try {
+      models.subscribe("onDidGenerate", handler);
+      return 'ctx.models.subscribe("onDidGenerate", cb)';
+    } catch (e) {
+      log(`[ZPowerPack] 订阅形态 ctx.models.subscribe("onDidGenerate", cb) 绑定失败：${e?.message ?? ""}`);
+    }
+  }
+  // 候选 4：ctx 顶层通用 subscribe——事件全名优先、短名次之（挂载签名未知双猜）
+  if (typeof ctx?.subscribe === "function") {
+    try {
+      ctx.subscribe("models.onDidGenerate", handler);
+      return 'ctx.subscribe("models.onDidGenerate", cb)';
+    } catch (e) {
+      log(`[ZPowerPack] 订阅形态 ctx.subscribe("models.onDidGenerate", cb) 绑定失败：${e?.message ?? ""}`);
+    }
+    try {
+      ctx.subscribe("onDidGenerate", handler);
+      return 'ctx.subscribe("onDidGenerate", cb)';
+    } catch (e) {
+      log(`[ZPowerPack] 订阅形态 ctx.subscribe("onDidGenerate", cb) 绑定失败：${e?.message ?? ""}`);
+    }
+  }
+  return null;
+}
+
+/**
+ * 扩展激活入口：注册看板视图（entry + 三注册资源）、素条命令、绑定宿主订阅、启动 60s 拍。
  *
  * 素条推送形态 = view-model V2 的 strip（composer.status 插槽契约 text≤40/tooltip≤200），
- * V2 不再推送 badge（渲染组件从不消费）；宿主 models.onDidGenerate 订阅绑定与
- * sync 资源由 Task 6 接线，本入口产出 onGenerateEvent 供其绑定。
+ * V2 不再推送 badge（渲染组件从不消费）。Task 6 接线四件事：
+ * - 会话作用域素条（2026-11-23 修订 #1）：workbench.onDidChange 订阅感知可见会话，
+ *   slots.update 第三参 {sessionId} 按会话分别推送；速率只算该会话的流（events 的
+ *   sessionId 过滤）；订阅不可达 → 素条对象降级「最近有事件的会话」（无事件时全局素条兜底）；
+ * - tooltip 额度（修订 #2）：聚焦会话当前模型选择的供应商（context.get({sessionId})），
+ *   组合上下文为 null（新会话未发首条）→ 回退该会话最近请求供应商；
+ * - 推送链（§五.8）：onDidOpen 存 {notify}、onDidClose 清引用；数据更新（60s 拍、
+ *   事件节流拍、sync 即时拍）一律 notify("zpowerpack://display")；
+ * - sync 资源（§五.4）：read 置 quotaPending 即时拉取官方额度并返回 {quota}。
  *
- * @param {object} ctx 扩展上下文（views/commands/slots 宿主 API）
+ * @param {object} ctx 扩展上下文（views/commands/slots/workbench/context/models 宿主 API）
  * @param {{intervalMs?: number, snapshotPath?: string, deps?: object, log?: Function}} opts
  *        宿主只传 ctx；opts 供测试注入（注入 deps 时不落默认快照文件，避免测试污染真机）
- * @returns {Promise<{stop: Function, onGenerateEvent: Function}>} 轮询句柄
- *          （宿主不消费返回值；测试与运维用；Task 6 取 onGenerateEvent 绑定订阅）
+ * @returns {Promise<{stop: Function, onGenerateEvent: Function}>} 服务句柄
+ *          （宿主不消费返回值；测试直驱 onGenerateEvent 验证会话素条链路）
  */
 export async function activate(ctx, opts = {}) {
   const log = opts.log ?? ((l) => console.log(l));
@@ -512,35 +591,127 @@ export async function activate(ctx, opts = {}) {
   // 最新快照/展示模型缓存：注册资源 read 的唯一数据源，由 deliver 回调刷新
   let latestSnapshot = null;
   let latestDisplay = null;
-  let lastStripKey = "";
+  // 视图句柄缓存（推送链 §五.8）：onDidOpen 保存 {notify}，onDidClose 清引用防向已关闭视图推送
+  let viewPort = null;
+  // 会话作用域状态（修订 #1）：requestId→sessionId 归属（素条流过滤依据）
+  const reqSession = new Map();
+  // sessionId→最近请求供应商（组合上下文为 null 时的 tooltip 回退，事件到达时刷新）
+  const sessionProvider = new Map();
+  // 最近有事件的会话：workbench 订阅不可达时的素条降级对象
+  let lastEventSession = null;
+  // workbench 订阅绑定结果与可见会话缓存（载荷形状 {sessions:[{sessionId, workspace, isDraft, focused}]}）
+  let workbenchOk = false;
+  let visibleSessions = [];
+  // 素条同值去重：作用域键（会话 id，全局=""）→ 最近一次 text|tooltip（按作用域各自去重）
+  const lastStripKeys = new Map();
+  // 素条推送编排：context.get 为异步 call，deliver 同步段只做缓存刷新与排程（事件风暴护栏）
+  let stripsBusy = false;
+  let stripsDirty = false;
 
   /** 素条推送：文本+tooltip 相同则跳过（防 60s 拍/事件流刷屏）；V2 不推 badge（渲染侧从不消费） */
-  const pushStrip = (strip) => {
+  const pushStrip = (strip, scope) => {
+    const scopeKey = typeof scope?.sessionId === "string" ? scope.sessionId : "";
     const key = `${strip.text}|${strip.tooltip}`;
-    if (key === lastStripKey) return;
-    lastStripKey = key;
+    if (lastStripKeys.get(scopeKey) === key) return;
+    lastStripKeys.set(scopeKey, key);
     try {
-      ctx.slots.update("zpowerpack-mini", { text: strip.text, tooltip: strip.tooltip, visible: true });
+      // 第三参=会话作用域（宿主源码实证；真机形态不符由探测段诊断揭示后校准）
+      ctx.slots.update("zpowerpack-mini", { text: strip.text, tooltip: strip.tooltip, visible: true }, scope);
     } catch (e) {
       log(`[ZPowerPack] 素条推送失败（${e?.name || "异常"}）：${e?.message ?? ""}`);
     }
   };
 
-  // 送达回调：双缓存刷新 + 素条推送（快照文件由 start 的 snapshotPath 通道写）
+  /** 数据更新通知（推送链 §五.8）：打开中的视图重读 display 注册资源；视图未开/已关则跳过 */
+  const notifyDisplay = () => {
+    if (viewPort === null) return;
+    try {
+      viewPort.notify("zpowerpack://display");
+    } catch (e) {
+      log(`[看板] 视图通知失败（${e?.name || "异常"}）：${e?.message ?? ""}`);
+    }
+  };
+
+  /**
+   * 素条按会话分别推送（修订 #1）：对每个目标会话组装 focus 段（该会话的流 +
+   * 聚焦供应商额度行）后经 view-model 出四态文案；多窗口各自看到自己会话的值。
+   * tooltip 额度供应商（修订 #2）：context.get({sessionId}) 的当前模型选择优先，
+   * 组合上下文为 null（新会话未发首条）→ 回退该会话最近请求供应商（sessionProvider）。
+   */
+  const pushStrips = async () => {
+    const snap = latestSnapshot;
+    if (snap === null) return;
+    // 目标会话：workbench 可见会话全集；订阅不可达 → 最近事件会话；再无 → 全局素条（刚装形态兜底）
+    const targets = workbenchOk ? visibleSessions.map((s) => s.sessionId) : lastEventSession === null ? [] : [lastEventSession];
+    if (targets.length === 0) {
+      pushStrip(latestDisplay.strip);
+      return;
+    }
+    for (const sessionId of targets) {
+      // 该会话当前模型选择（组合上下文；读不到按 null 走回退，不中断其余会话的推送）
+      let model = null;
+      try {
+        model = (await ctx?.context?.get?.({ sessionId }))?.model ?? null;
+      } catch {
+        model = null;
+      }
+      const providerId = typeof model?.providerId === "string" ? model.providerId : (sessionProvider.get(sessionId) ?? null);
+      // 素条 tooltip 额度窗口取该供应商的 quota 实例；供应商不在规则表内 → null（不编造水位）
+      const quotaRow = providerId === null ? null : ((snap.quota ?? []).find((q) => q?.providerId === providerId) ?? null);
+      // 速率只算该会话的流：requestId→sessionId 归属过滤（events 的 sessionId 口径）
+      const streams = (snap.rate?.streams ?? []).filter((s) => reqSession.get(s?.requestId) === sessionId);
+      const dm = toDisplayModelV2(
+        { ...snap, focus: { sessionId, modelId: model?.modelId ?? null, providerId, quotaRow, streams } },
+        Date.now(),
+      );
+      pushStrip(dm.strip, { sessionId });
+    }
+  };
+
+  /** 素条推送排程：在飞合并、后到快照标脏重跑（1s 事件节流 + context.get 异步下不叠加并发推送） */
+  const scheduleStripPush = () => {
+    if (stripsBusy) {
+      stripsDirty = true;
+      return;
+    }
+    stripsBusy = true;
+    void pushStrips()
+      .catch((e) => log(`[ZPowerPack] 素条推送编排失败（${e?.name || "异常"}）：${e?.message ?? ""}`))
+      .finally(() => {
+        stripsBusy = false;
+        if (stripsDirty) {
+          stripsDirty = false;
+          scheduleStripPush();
+        }
+      });
+  };
+
+  // 送达回调：双缓存刷新 + 视图通知 + 素条排程（快照文件由 start 的 snapshotPath 通道写）
   const deliver = (snapshot) => {
     latestSnapshot = snapshot;
     latestDisplay = toDisplayModelV2(snapshot, Date.now());
-    pushStrip(latestDisplay.strip);
+    notifyDisplay();
+    scheduleStripPush();
   };
 
   try {
     ctx.views.register("zpowerpack-dashboard", {
       // entry 相对插件根解析（V1 探针 ENOENT 实证教训）
       entry: "extension/view/index.html",
-      // info=宿主打开视图时传入的句柄（临时：Task 0 采集段消费键集与 notify 形态，T6 移除后仅保留日志）
+      // info=宿主打开视图时传入的句柄（临时：Task 0 采集段消费键集与 notify 形态，T8 移除后仅保留日志）
       onDidOpen: (info) => {
         log("[看板] 视图已打开");
         recordProbeViewOpen(info);
+        // 推送链（§五.8）：保存 notify 句柄，数据更新时通知视图重读 display
+        viewPort = typeof info?.notify === "function" ? { notify: info.notify } : null;
+        try {
+          // 视图关闭由宿主回调：清引用，防向已关闭视图推送通知
+          info?.onDidClose?.(() => {
+            viewPort = null;
+          });
+        } catch (e) {
+          log(`[看板] 视图关闭回调注册失败（${e?.message ?? ""}）`);
+        }
       },
       resources: {
         // 展示模型：视图取数资源（V2 素条/面板文案映射已在 view-model 完成）
@@ -552,6 +723,15 @@ export async function activate(ctx, opts = {}) {
         "zpowerpack://snapshot": {
           mimeType: "application/json",
           read: () => JSON.stringify(latestSnapshot ?? {}),
+        },
+        // 手动同步（§五.4）：read 置待办绕过 60s TTL 即拉官方额度 → 返回 {quota}；
+        // 同拍的 deliver 通道负责 notify display（视图重读后即时重渲）
+        "zpowerpack://sync": {
+          mimeType: "application/json",
+          read: async () => {
+            await handle.syncQuota();
+            return JSON.stringify({ quota: (latestSnapshot ?? {}).quota ?? [] });
+          },
         },
       },
     });
@@ -568,12 +748,66 @@ export async function activate(ctx, opts = {}) {
     log(`[ZPowerPack] 命令注册失败（${e?.name || "异常"}）：${e?.message ?? ""}`);
   }
 
+  // ---- 聚焦会话感知（修订 #1）：workbench 订阅 + 初值拉取 ----
+  /** workbench 载荷 → 可见会话缓存（素条按会话分别推送的对象集；载荷形状宿主实证） */
+  const applyWorkbench = (payload) => {
+    const sessions = Array.isArray(payload?.sessions) ? payload.sessions : [];
+    visibleSessions = sessions.filter((s) => typeof s?.sessionId === "string");
+  };
+  try {
+    const wb = ctx?.workbench;
+    if (typeof wb?.onDidChange === "function") {
+      wb.onDidChange(applyWorkbench);
+      workbenchOk = true;
+    } else if (typeof wb?.onDidChange?.subscribe === "function") {
+      // Rx 风格对象挂载（与生成事件候选序列同思路的形态兼容）
+      wb.onDidChange.subscribe(applyWorkbench);
+      workbenchOk = true;
+    }
+    if (workbenchOk) {
+      log("[ZPowerPack] workbench 会话订阅已绑定");
+      // 初值拉取：订阅载荷只在未来变更时到达，激活时已可见的会话需主动补一次
+      if (typeof wb.visibleSessions === "function") {
+        Promise.resolve(wb.visibleSessions())
+          .then(applyWorkbench)
+          .catch((e) => log(`[ZPowerPack] 可见会话初值拉取失败（${e?.message ?? ""}）`));
+      }
+    } else {
+      log("[ZPowerPack] workbench 会话订阅不可达，素条降级为最近事件会话");
+    }
+  } catch (e) {
+    workbenchOk = false;
+    log(`[ZPowerPack] workbench 会话订阅不可达（${e?.message ?? ""}），素条降级为最近事件会话`);
+  }
+
   // 测试注入 deps 时不落默认快照文件（防真机副作用）；生产无 opts 时写默认路径
   const snapshotPath = opts.snapshotPath ?? (opts.deps ? undefined : defaultSnapshotPath());
   const handle = start({ intervalMs: opts.intervalMs, snapshotPath, deps: opts.deps, deliver, log });
 
-  // ---- 临时：Task 0 采集段（T6 移除）----
-  // 探针插件已卸载：订阅形态探测并入本次激活，供用户一次重启后采集定案；
+  // 事件入口包装：先记会话归属（素条流过滤/tooltip 回退供应商的数据底座）再转发服务层；
+  // 追踪段独立捕获——归属失败不吞事件（速率直录不受影响）
+  const onGenerateEvent = (ev, now = Date.now()) => {
+    try {
+      if (typeof ev?.sessionId === "string" && typeof ev?.requestId === "string") {
+        reqSession.set(ev.requestId, ev.sessionId);
+        // final 收流后映射即删（防长期运行无界增长；素条只过滤活跃流，历史归属无用）
+        if (ev.phase === "final") reqSession.delete(ev.requestId);
+        if (typeof ev?.model?.providerId === "string") sessionProvider.set(ev.sessionId, ev.model.providerId);
+        lastEventSession = ev.sessionId;
+      }
+    } catch {
+      // 归属追踪失败不影响事件转发
+    }
+    handle.onGenerateEvent(ev, now);
+  };
+
+  // 订阅绑定（候选序列同临时探测段，先成功者胜）：全败 → 中文 warn，速率走 tickV2 兜底行（§五.5）
+  const activeForm = bindOnGenerate(ctx, onGenerateEvent, log);
+  if (activeForm !== null) log(`[ZPowerPack] 生成事件订阅已绑定（${activeForm}）`);
+  else log("[ZPowerPack] 生成事件订阅不可达（候选形态全败），速率走落库兜底链");
+
+  // ---- 临时：Task 0 采集段（T8 移除）----
+  // 探针插件已卸载：订阅形态探测并入本次激活，供 V2 首次真机部署同轮采集定案；
   // 独立 try/catch——任何探测失败绝不影响上方已完成的服务行为（全同步快速操作，10 秒激活预算内）。
   // opts.deps 注入（单元测试）时跳过：mock ctx 无探测价值，且防真机诊断文件污染。
   if (!opts.deps) {
@@ -583,11 +817,12 @@ export async function activate(ctx, opts = {}) {
       log(`[ZPowerPack] Task 0 采集段失败（不影响服务，${e?.name || "异常"}）：${e?.message ?? ""}`);
     }
   }
-  return handle;
+  // 返回包装后的事件入口（测试直驱可验证会话素条链路）；宿主不消费返回值
+  return { stop: handle.stop, onGenerateEvent };
 }
 
 /* ============================================================================
- * 临时：Task 0 采集段（T6 移除）——探针插件已卸载后的替代采集路径。
+ * 临时：Task 0 采集段（T8 移除）——探针插件已卸载后的替代采集路径。
  *
  * 职责：候选订阅形态逐一 try/catch 探测（models.onDidGenerate 函数直挂/.subscribe 对象双猜、
  * models.subscribe 通用入口、ctx 顶层 subscribe 双签名、ctx 键含 subscribe/capabilities/protocol
@@ -607,7 +842,7 @@ let probeLastEventAt = null;
 /** 诊断容器（模块级）：runProbeCollection 建立，事件/onDidOpen 回调持续填充；null=采集未启用（记录函数判空直跳） */
 let probeDiag = null;
 
-/** 只读 db 打开结果单例：realDeps 与采集段共用同一连接，采集段不重复 openDb（T6 随采集段还原为 realDeps 局部调用） */
+/** 只读 db 打开结果单例：realDeps 与采集段共用同一连接，采集段不重复 openDb（T8 随采集段还原为 realDeps 局部调用） */
 let probeSharedDb = null;
 function sharedOpenDb(homedir) {
   if (probeSharedDb === null) probeSharedDb = openDb(resolveDbPath(process.env, homedir));
@@ -882,7 +1117,7 @@ function recordProbeViewOpen(info) {
 function runProbeCollection(ctx, log) {
   probeDiag = {
     capturedAt: new Date().toISOString(),
-    note: "临时：Task 0 采集（T6 移除）——探针插件已卸载，宿主一次重启内采集订阅形态定案",
+    note: "临时：Task 0 采集（T8 移除）——探针插件已卸载，宿主一次重启内采集订阅形态定案",
     // ctx API 面：键名 + 每键值类型/对象键集（正式实现的宿主 API 使用依据）
     ctxApi: null,
     // 订阅候选结论：candidates=每形态绑定结果（bound/skip/error + 句柄类型），activeForm=首个绑定成功形态
@@ -923,5 +1158,5 @@ function runProbeCollection(ctx, log) {
   }
 
   flushProbeDiag();
-  log("[ZPowerPack] Task 0 采集段完成，诊断已写盘（临时，T6 移除）");
+  log("[ZPowerPack] Task 0 采集段完成，诊断已写盘（临时，T8 移除）");
 }

@@ -3,6 +3,8 @@
  * 经 env 改道把全部真实路径指向临时目录，activate() 全链跑 3 个以上轮询周期——
  * 首拍回填落小时桶→额度引擎（keyless 不发请求）→快照文件→注册资源→素条推送，
  * 再直驱 onGenerateEvent 钉「官方事件 → 素条点亮」端到端链路；任何输出不含密钥。
+ * Task 6 接线扩展：workbench/context mock 下会话作用域素条（slots 第三参）、
+ * notify 推送链句柄、sync 资源即时拉取（停拍隔离验证）。
  *
  * HTTP 边界排除（Ruling 沿用）：provider 夹具无 apiKey → computeQuota 走 unavailable
  * 分支不发请求；厂商接口已由 quota-fetch.test 注入 fetch 全覆盖，真实联调归真机验收。
@@ -101,17 +103,39 @@ test("集成：真实 schema db + provider 夹具 → activate 全链 → 快照
 
   // mock ctx（宿主注册面），真实 deps（真 db + 真额度引擎 + 真路径解析）
   const calls = { views: [], commands: [], slots: [], opened: [] };
+  // 推送链句柄模拟：视图打开期间宿主侧收到的 notify uri 记录
+  const notifyCalls = [];
+  let viewCloseCb = null;
   const ctx = {
     views: { register: (id, def) => calls.views.push({ id, def }), open: (id) => calls.opened.push(id) },
     commands: { register: (id, fn) => calls.commands.push({ id, fn }) },
-    slots: { update: (id, patch) => calls.slots.push({ id, patch }) },
+    // 会话作用域素条（修订 #1）：第三参作用域也要记录
+    slots: { update: (id, patch, scope) => calls.slots.push({ id, patch, scope }) },
+    // workbench 模拟（宿主实证形状）：单窗口聚焦根会话，初值经 visibleSessions 拉取
+    workbench: {
+      onDidChange: () => {},
+      visibleSessions: async () => ({
+        sessions: [{ sessionId: "sess-root", workspace: "E:\\code\\plugin\\zcode\\ZPowerPack", isDraft: false, focused: true }],
+      }),
+    },
+    // context.get 模拟（宿主实证）：根会话已选模型 → tooltip 额度供应商 bigmodel-api
+    context: {
+      get: async ({ sessionId }) => (sessionId === "sess-root" ? { model: { providerId: "bigmodel-api", modelId: "glm-4.7", contextWindow: 200000 } } : null),
+    },
   };
 
+  // 快照文件路径（sync 断言在停拍段读取，声明前置避免时序引用）
+  const snapshotPath = join(tmp, "cli", "zpowerpack", "last-snapshot.json");
+
   let handle;
+  let syncQuota = null;
+  let snapAtSync = null;
   try {
     handle = await activate(ctx, { intervalMs: 150, log: () => {} });
+    // 模拟宿主打开视图（推送链 §五.8）：句柄带 notify(uri) 与 onDidClose(cb)
+    calls.views[0].def.onDidOpen({ notify: (uri) => notifyCalls.push(uri), onDidClose: (cb) => (viewCloseCb = cb) });
     await new Promise((r) => setTimeout(r, 500)); // 3 个以上轮询周期（首拍回填+增量）
-    // 生成事件直驱（Task 6 绑定宿主订阅；本测试钉「官方事件 → 素条点亮」端到端链路）
+    // 生成事件直驱（Task 6 绑定宿主订阅；本测试钉「官方事件 → 会话素条点亮」端到端链路）
     handle.onGenerateEvent(
       {
         sessionId: "sess-root",
@@ -122,6 +146,18 @@ test("集成：真实 schema db + provider 夹具 → activate 全链 → 快照
       },
       Date.now(),
     );
+    await new Promise((r) => setTimeout(r, 80)); // 事件型 deliver → 会话素条/视图通知落地
+    handle.stop(); // 停拍：隔离 sync 即时拉取断言（此后任何快照重写只能来自 sync 触发的拍）
+    viewCloseCb(); // 模拟视图关闭：notify 句柄引用清除
+    const notifyAtClose = notifyCalls.length;
+    // sync 手动同步通道（Task 6）：read 置待办 → 即时跑一拍 → {quota} 返回 + 快照重写
+    const before = JSON.parse(readFileSync(snapshotPath, "utf8")).generatedAt;
+    syncQuota = JSON.parse(await calls.views[0].def.resources["zpowerpack://sync"].read({ view: {} }));
+    snapAtSync = JSON.parse(readFileSync(snapshotPath, "utf8"));
+    assert.deepEqual(Object.keys(syncQuota), ["quota"], "sync 返回 {quota} 载荷");
+    assert.equal(syncQuota.quota.length, 3, "sync 即时拉取返回三家实例额度");
+    assert.ok(snapAtSync.generatedAt >= before, "sync 触发的即时拍重写快照文件");
+    assert.equal(notifyCalls.length, notifyAtClose, "视图关闭后 sync 拍不得再通知已关闭视图");
   } finally {
     if (handle) handle.stop();
     envKeys.forEach((k, i) => {
@@ -131,7 +167,6 @@ test("集成：真实 schema db + provider 夹具 → activate 全链 → 快照
   }
 
   // ---- ① 快照文件兜底通道：真实路径解析 + 原子写；V2 契约五段、无 charts ----
-  const snapshotPath = join(tmp, "cli", "zpowerpack", "last-snapshot.json");
   const snapText = readFileSync(snapshotPath, "utf8");
   const snap = JSON.parse(snapText);
   assert.ok(!("charts" in snap), "V2 快照无 charts 键（八报表退役）");
@@ -213,6 +248,17 @@ test("集成：真实 schema db + provider 夹具 → activate 全链 → 快照
   assert.ok(childRow && childRow.parent_id === "sess-root", "子代理会话 parent_id 已采到（归属对照数据）");
   // 采集段不触碰 provider 文档 → 诊断无密钥
   assert.ok(!diagText.includes("apiKey"), "诊断文件不得出现 apiKey 字样");
+
+  // ---- ⑩ 会话作用域素条（2026-11-23 修订 #1）：事件按 sessionId 过滤，slots.update 第三参推给聚焦会话 ----
+  const scoped = calls.slots.filter((s) => s.id === "zpowerpack-mini" && s.scope?.sessionId === "sess-root");
+  assert.ok(scoped.length >= 1, "聚焦会话应收到作用域素条");
+  assert.equal(scoped[scoped.length - 1].patch.text, "428 tok/s", "会话素条=该会话流速率（无百分比水位不编造）");
+  // tooltip 额度头=聚焦会话当前模型选择供应商（修订 #2，context.get mock）的 quota 行
+  assert.equal(scoped[scoped.length - 1].patch.tooltip, "智谱 GLM Coding · 主 428 tok/s · 点击查看详情");
+
+  // ---- ⑪ 推送链（Task 6 接线）：视图打开期间数据更新 → notify(display) 恰在打开窗口内 ----
+  assert.ok(notifyCalls.length >= 1, "视图打开期间应收到 display 更新通知");
+  assert.ok(notifyCalls.every((u) => u === "zpowerpack://display"), "通知 uri 固定为 display");
 
   // 清理：Windows 下 sqlite 只读句柄释放有延迟，rm 失败容忍（临时目录由 OS 回收）
   try {
