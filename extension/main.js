@@ -701,6 +701,8 @@ export async function activate(ctx, opts = {}) {
    * 聚焦供应商额度行）后经 view-model 出四态文案；多窗口各自看到自己会话的值。
    * tooltip 额度供应商（修订 #2）：context.get({sessionId}) 的当前模型选择优先，
    * 组合上下文为 null（新会话未发首条）→ 回退该会话最近请求供应商（sessionProvider）。
+   * 0.2.1 临时：每次推送的逐会话 context.get 结果（含异常原文）经 recordStripPush 落诊断
+   * （T9 采集后随探测段移除，不改变推送行为）。
    */
   const pushStrips = async () => {
     const snap = latestSnapshot;
@@ -709,15 +711,22 @@ export async function activate(ctx, opts = {}) {
     const targets = workbenchOk ? visibleSessions.map((s) => s.sessionId) : lastEventSession === null ? [] : [lastEventSession];
     if (targets.length === 0) {
       pushStrip(latestDisplay.strip);
+      // 采样也记录全局兜底形态（targets 为空），便于对照「无会话→待机」的真机形态
+      recordStripPush({ at: new Date().toISOString(), targets: [], perSession: [] });
       return;
     }
+    // 0.2.1 临时采样容器（T9 采集后随本段移除）：逐会话 context.get 结果与最终供应商选择
+    const perSession = [];
     for (const sessionId of targets) {
       // 该会话当前模型选择（组合上下文；读不到按 null 走回退，不中断其余会话的推送）
       let model = null;
+      let contextError = null;
       try {
         model = (await ctx?.context?.get?.({ sessionId }))?.model ?? null;
-      } catch {
+      } catch (e) {
         model = null;
+        // 错误 message 原文是「厂商选择假」定案的关键证据（宿主声明 schema 带 model{providerId,modelId,contextWindow}）
+        contextError = e?.message ?? String(e);
       }
       const providerId = typeof model?.providerId === "string" ? model.providerId : (sessionProvider.get(sessionId) ?? null);
       // 素条 tooltip 额度窗口取该供应商的 quota 实例；供应商不在规则表内 → null（不编造水位）
@@ -729,7 +738,17 @@ export async function activate(ctx, opts = {}) {
         Date.now(),
       );
       pushStrip(dm.strip, { sessionId });
+      // 采样字段（证据链定案口径）：contextModel=context.get 的模型选择（可空）；
+      // contextError=异常原文；chosenProviderId=实际采用供应商；quotaFound=是否命中额度行
+      perSession.push({
+        sessionId,
+        contextModel: model === null ? null : { providerId: model.providerId ?? null, modelId: model.modelId ?? null },
+        contextError,
+        chosenProviderId: providerId,
+        quotaFound: quotaRow !== null,
+      });
     }
+    recordStripPush({ at: new Date().toISOString(), targets, perSession });
   };
 
   /** 素条推送排程：在飞合并、后到快照标脏重跑（1s 事件节流 + context.get 异步下不叠加并发推送） */
@@ -873,6 +892,35 @@ export async function activate(ctx, opts = {}) {
     log(`[ZPowerPack] workbench 会话订阅不可达（${e?.message ?? ""}），素条降级为最近事件会话`);
   }
 
+  // ---- 素条跟手（0.2.1）：context.onDidChange 订阅 ----
+  // 宿主声明实证：context.onDidChange（kind=subscribe，输出 {sessionId, revision}）。聚焦会话切换
+  // 模型/上下文变更时立即重推素条（tooltip 额度供应商随上下文变化），不必等 60s 拍或下一条生成事件。
+  // 候选形态与 bindOnGenerate 同款：函数直挂 → 同名 .subscribe 对象（Rx 风格），先成功者胜；
+  // 绑定失败静默降级（既有轮询/事件素条链不受影响），仅中文 warn 一次（含宿主错误原文）。
+  let contextChangeForm = null;
+  let contextChangeError = null;
+  try {
+    const contextApi = ctx?.context;
+    const onContextChange = () => scheduleStripPush();
+    if (typeof contextApi?.onDidChange === "function") {
+      contextChangeForm = "ctx.context.onDidChange()";
+      const dispose = toDisposer(contextApi.onDidChange(onContextChange));
+      if (dispose) disposers.push(dispose);
+    } else if (contextApi?.onDidChange && typeof contextApi.onDidChange.subscribe === "function") {
+      contextChangeForm = "ctx.context.onDidChange.subscribe()";
+      const dispose = toDisposer(contextApi.onDidChange.subscribe(onContextChange));
+      if (dispose) disposers.push(dispose);
+    }
+  } catch (e) {
+    contextChangeForm = null;
+    contextChangeError = e?.message ?? String(e);
+  }
+  if (contextChangeForm !== null) {
+    log(`[ZPowerPack] context.onDidChange 订阅已绑定（${contextChangeForm}，素条随上下文变更跟手）`);
+  } else {
+    log(`[ZPowerPack] context.onDidChange 订阅不可达${contextChangeError === null ? "" : `（${contextChangeError}）`}，素条仍由 60s 拍/事件驱动更新`);
+  }
+
   // 测试注入 deps 时不落默认快照文件（防真机副作用）；生产无 opts 时写默认路径
   const snapshotPath = opts.snapshotPath ?? (opts.deps ? undefined : defaultSnapshotPath());
   const handle = start({ intervalMs: opts.intervalMs, snapshotPath, deps: opts.deps, deliver, log });
@@ -965,6 +1013,9 @@ export function deactivate() {
 /** 生成事件累积上限：流式期事件高频到达，超出即丢弃，防诊断文件无限膨胀 */
 const PROBE_EVENT_LIMIT = 20;
 
+/** 素条推送采样上限（0.2.1 厂商选择证据链）：每次推送一条，T9 采集后随本段移除 */
+const PROBE_STRIP_LIMIT = 10;
+
 /** 最近一次生成事件的毫秒时刻：相邻间隔毫秒的原始数据（节流常数定案依据） */
 let probeLastEventAt = null;
 
@@ -997,6 +1048,27 @@ function flushProbeDiag() {
     renameSync(tmp, probeDiagPath());
   } catch (e) {
     probeDiag?.errors?.push("诊断写盘失败: " + (e?.message ?? String(e)));
+  }
+}
+
+/**
+ * 素条推送采样记录（0.2.1 真机证据链）：pushStrips 每次推送落一条样本（上限 10 条），
+ * 记录目标会话与逐会话 context.get 结果。目的：`context.get({sessionId})` 的真实返回行为
+ * 尚未真机验证（用户反馈「厂商选择完全是假的」），把模型选择/异常原文/最终供应商落盘供 T9 定案。
+ * 采集未启用（probeDiag=null，注入 deps 的单元测试路径）判空直跳；写盘复用 flushProbeDiag
+ * 原子通道；采样任何失败不外抛（诊断通道不干扰素条推送本身）。
+ * @param {{at: string, targets: string[], perSession: object[]}} sample 本次推送的采样快照
+ * @returns {void} 无返回值；达到上限后的样本直接丢弃
+ */
+function recordStripPush(sample) {
+  if (!probeDiag) return;
+  try {
+    if (!Array.isArray(probeDiag.stripPushes)) probeDiag.stripPushes = [];
+    if (probeDiag.stripPushes.length >= PROBE_STRIP_LIMIT) return;
+    probeDiag.stripPushes.push(sample);
+    flushProbeDiag();
+  } catch {
+    // 采样失败不得影响素条推送
   }
 }
 
@@ -1262,6 +1334,8 @@ function runProbeCollection(ctx, log) {
     viewOpenInfo: null,
     // session 采样：最近 3 活跃会话 id/parent_id（事件归属对照）
     sessionParentSample: null,
+    // 素条推送采样（0.2.1）：每次 pushStrips 一条，含逐会话 context.get 结果/异常原文（≤10 条）
+    stripPushes: [],
     errors: [],
   };
 

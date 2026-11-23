@@ -1,6 +1,6 @@
 {
   "name": "zpowerpack",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "ZPowerPack：zcode 存储迁移向导与用量看板——实时 token 速率、套餐额度窗口与 24h 消耗趋势，桌面端原生内嵌展示。",
   "author": { "name": "ZPowerPack" },
   "license": "MIT",

@@ -281,7 +281,7 @@ test("集成：真实 schema db + provider 夹具 → activate 全链 → 快照
   const diagPath = join(tmp, "cli", "zpowerpack", "v2-probe-diagnostics.json");
   const diagText = readFileSync(diagPath, "utf8");
   const diag = JSON.parse(diagText);
-  for (const key of ["ctxApi", "modelsSubscribe", "generateEvents", "viewOpenInfo", "sessionParentSample", "errors"]) {
+  for (const key of ["ctxApi", "modelsSubscribe", "generateEvents", "viewOpenInfo", "sessionParentSample", "stripPushes", "errors"]) {
     assert.ok(key in diag, `诊断缺少 ${key} 段`);
   }
   assert.ok(diag.ctxApi.views && diag.ctxApi.commands && diag.ctxApi.slots, "ctx 键枚举覆盖 mock ctx 全部命名空间");
@@ -314,6 +314,93 @@ test("集成：真实 schema db + provider 夹具 → activate 全链 → 快照
     rmSync(tmp, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
   } catch {
     // 句柄未释放时留待 OS 清理
+  }
+});
+
+test("集成：素条推送采样落诊断 stripPushes——contextModel/contextError 原文（0.2.1 厂商选择证据链）", async () => {
+  const { tmp, dbPath, providerPath } = buildEnv();
+
+  const envKeys = ["ZCODE_SESSION_DB_PATH", "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE", "ZCODE_STORAGE_DIR"];
+  const saved = envKeys.map((k) => process.env[k]);
+  process.env.ZCODE_SESSION_DB_PATH = dbPath;
+  process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = providerPath;
+  process.env.ZCODE_STORAGE_DIR = join(tmp, "cli");
+
+  const calls = { views: [], commands: [], slots: [], opened: [] };
+  const ctx = {
+    views: { register: (id, def) => calls.views.push({ id, def }), open: (id) => calls.opened.push(id) },
+    commands: { register: (id, fn) => calls.commands.push({ id, fn }) },
+    slots: { update: (id, patch, scope) => calls.slots.push({ id, patch, scope }) },
+    // 两会话可见：根会话 context.get 正常，子会话抛错——两态样本进同一条采样
+    workbench: {
+      onDidChange: () => {},
+      visibleSessions: async () => ({
+        sessions: [
+          { sessionId: "sess-root", workspace: "E:\\code\\plugin\\zcode\\ZPowerPack", isDraft: false, focused: true },
+          { sessionId: "sess-child", workspace: "E:\\code\\plugin\\zcode\\ZPowerPack", isDraft: false, focused: false },
+        ],
+      }),
+    },
+    context: {
+      get: async ({ sessionId }) => {
+        if (sessionId === "sess-child") throw new Error("上下文不可用(真机形态未知)");
+        return { model: { providerId: "bigmodel-api", modelId: "glm-4.7", contextWindow: 200000 } };
+      },
+    },
+  };
+
+  let handle;
+  try {
+    // 不注入 deps：探测段真实执行（stripPushes 复用现有诊断写盘通道）
+    handle = await activate(ctx, { intervalMs: 60000, log: () => {} });
+    await new Promise((r) => setTimeout(r, 120)); // 可见会话初值 + 首拍素条落地
+    // 夹具事件直驱：事件型 deliver → pushStrips → 逐会话 context.get → 采样写盘
+    handle.onGenerateEvent(
+      {
+        sessionId: "sess-root",
+        requestId: "req-1",
+        model: { providerId: "bigmodel-api", modelId: "glm-4.7" },
+        phase: "streaming",
+        outputTokensPerSecond: 428,
+      },
+      Date.now(),
+    );
+    await new Promise((r) => setTimeout(r, 120));
+
+    const diagPath = join(tmp, "cli", "zpowerpack", "v2-probe-diagnostics.json");
+    const diagText = readFileSync(diagPath, "utf8");
+    const diag = JSON.parse(diagText);
+    assert.ok(Array.isArray(diag.stripPushes) && diag.stripPushes.length >= 1, "诊断须含素条推送采样 stripPushes");
+    assert.ok(diag.stripPushes.length <= 10, "采样上限 10 条（诊断文件不得无限膨胀）");
+    const sample = diag.stripPushes[diag.stripPushes.length - 1];
+    assert.equal(typeof sample.at, "string", "采样须带时刻");
+    assert.ok(sample.targets.includes("sess-root") && sample.targets.includes("sess-child"), "采样须记录目标会话全集");
+    const root = sample.perSession.find((p) => p.sessionId === "sess-root");
+    const child = sample.perSession.find((p) => p.sessionId === "sess-child");
+    assert.ok(root && child, "两会话均须入采样");
+    // 成功路径：context.get 的模型选择原样落盘（providerId/modelId），错误为 null
+    assert.deepEqual(root.contextModel, { providerId: "bigmodel-api", modelId: "glm-4.7" }, "context.get 模型选择须原样采样");
+    assert.equal(root.contextError, null, "成功路径 contextError 必须为 null");
+    assert.equal(root.chosenProviderId, "bigmodel-api", "采样须记录实际采用的供应商");
+    assert.equal(root.quotaFound, true, "供应商在规则表内 → quotaFound=true");
+    // 异常路径：错误 message 原文是「厂商选择假」定案的关键证据，不得吞掉
+    assert.equal(child.contextModel, null, "context.get 失败 → contextModel 为 null");
+    assert.ok(typeof child.contextError === "string" && child.contextError.includes("上下文不可用"), "context.get 异常原文必须落盘: " + child.contextError);
+    assert.equal(child.chosenProviderId, null, "无上下文且无事件 → 无供应商可跟");
+    assert.equal(child.quotaFound, false, "无供应商 → 无额度行");
+    // 密钥纪律：采样只含供应商/模型标识，不得出现 apiKey
+    assert.ok(!diagText.includes("apiKey"), "诊断文件不得出现 apiKey 字样");
+  } finally {
+    if (handle) handle.stop();
+    envKeys.forEach((k, i) => {
+      if (saved[i] === undefined) delete process.env[k];
+      else process.env[k] = saved[i];
+    });
+    try {
+      rmSync(tmp, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    } catch {
+      // 句柄未释放时留待 OS 清理
+    }
   }
 });
 

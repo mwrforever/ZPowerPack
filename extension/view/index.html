@@ -129,11 +129,11 @@ body::before{content:"";position:fixed;inset:0;background:radial-gradient(60% 34
 "use strict";
 /* 沙箱哑渲染（V2）：唯一取数通道 = 注册资源 zpowerpack://display（宿主 MCP 桥），
    展示模型 {strip, panel} 的全部文案/阈值/格式化已在扩展侧 view-model 完成，本脚本
-   只做 DOM 绑定、SVG 坐标换算与通道管理。取数双保险（扩展侧 notify 推送链宿主实证 +
-   沙箱 window.zcode 订阅入口暴露性未证实）：①启动时 typeof 探测一切可用订阅形态，
-   任何失败静默跳过；②无论订阅成败保留 1s 轻轮询兜底（V2 载荷小，无压力）。 */
+   只做 DOM 绑定、SVG 坐标换算与通道管理。取数通道（0.2.1 真机首跑修订）：视图侧不再
+   主动订阅——三候选订阅形态未经真机证实且疑与桥面报错相关，已整体移除；宿主 notify
+   只达「已订阅者」，视图无订阅者可收时由 1s 轻轮询保障数据新鲜度（V2 载荷小，无压力）。 */
 
-var POLL_FALLBACK_MS = 1000; // 轮询兜底节奏：订阅不可达/丢通知时数据新鲜度的下限
+var POLL_FALLBACK_MS = 1000; // 轮询兜底节奏：无订阅通道/丢通知时数据新鲜度的下限
 var SYNC_TIMEOUT_MS = 10000; // 同步按钮超时复位：readResource 悬挂时按钮不得永久禁用
 var TOAST_MS = 4000;         // 失败提示停留时长
 var RING_C = 100;            // 环周长归一（r=15.9 → 2πr≈100）：stroke-dasharray 直接用百分比
@@ -154,6 +154,21 @@ function readResource(uri) {
 /** 取数主通道：display 展示模型（{strip, panel}，字段全由扩展侧备好） */
 function readDisplay() {
   return readResource("zpowerpack://display").then(function (text) { return JSON.parse(text); });
+}
+
+/**
+ * 桥面键集摘要（0.2.1 真机证据链）：失败文案后附 window.zcode 的可用键，取值异常则省略。
+ * 目的：若重启后桥仍报错（真机首跑报 "E is not a function"），下一次错误文案直接给出
+ * 宿主桥的真实方法面，无需再靠猜形态；摘要段截断 200 字符内（错误文案不得溢出遮罩）。
+ */
+function zcodeKeysHint() {
+  try {
+    var keys = Object.keys(window.zcode || {});
+    var hint = " · zcode 键: [" + keys.join(", ") + "]";
+    return hint.length > 200 ? hint.slice(0, 200) : hint;
+  } catch (e) {
+    return "";
+  }
 }
 
 /** HTML 转义：展示模型的名称类字段进入 innerHTML 模板前一律过此関 */
@@ -331,30 +346,10 @@ function doSync() {
 }
 el("sync-btn").addEventListener("click", doSync);
 
-/** 订阅形态探测（真机校准点，暴露性未证实）：readResource 之外的一切可用订阅形态
- *  逐一 typeof 探测、先成功者胜，任何异常/缺位静默跳过——轮询兜底常在，订阅只是加速器。 */
-function trySubscribe() {
-  var z = window.zcode;
-  if (!z) return false;
-  var uri = "zpowerpack://display";
-  var binds = [
-    function () { return typeof z.subscribe === "function" && (z.subscribe(uri, refresh), true); },
-    function () { return !!z.resources && typeof z.resources.subscribe === "function" && (z.resources.subscribe(uri, refresh), true); },
-    function () { return typeof z.onResourceUpdated === "function" && (z.onResourceUpdated(uri, refresh), true); },
-  ];
-  for (var i = 0; i < binds.length; i++) {
-    try {
-      if (binds[i]()) return true;
-    } catch (e) {
-      /* 静默：候选形态失败不阻塞轮询兜底 */
-    }
-  }
-  return false;
-}
-
-/** 数据刷新入口（订阅回调/轮询/同步成功共用）：读 display → 差异渲染。
- *  在飞护栏：1s 轮询与订阅/同步可能同刻触发，前一次未落地时直接跳过，避免读请求叠加。
- *  失败不伪装成空数据：首帧前更新遮罩提示，首帧后静默重试（画面保持最后真值不假动）。 */
+/** 数据刷新入口（轮询/同步成功共用）：读 display → 差异渲染。
+ *  在飞护栏：1s 轮询与同步可能同刻触发，前一次未落地时直接跳过，避免读请求叠加。
+ *  失败不伪装成空数据：首帧前更新遮罩提示（附桥面键集供真机定位），首帧后静默重试
+ *  （画面保持最后真值不假动）。 */
 var inFlight = false;
 function refresh() {
   if (inFlight) return;
@@ -372,15 +367,14 @@ function refresh() {
         if (!booted) el("boot").textContent = "数据渲染失败…（" + (e && e.message ? e.message : "未知错误") + "）";
       }
     }, function (e) {
-      if (!booted) el("boot").textContent = "数据通道连接中…（" + (e && e.message ? e.message : "未知错误") + "）";
+      if (!booted) el("boot").textContent = "数据通道连接中…（" + (e && e.message ? e.message : "未知错误") + "）" + zcodeKeysHint();
     }).finally(function () { inFlight = false; });
   } catch (e) {
     inFlight = false;
-    if (!booted) el("boot").textContent = "数据通道连接中…（" + (e && e.message ? e.message : "未知错误") + "）";
+    if (!booted) el("boot").textContent = "数据通道连接中…（" + (e && e.message ? e.message : "未知错误") + "）" + zcodeKeysHint();
   }
 }
 
-trySubscribe();
 refresh();
 setInterval(refresh, POLL_FALLBACK_MS);
 </script>

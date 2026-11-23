@@ -82,10 +82,10 @@ test("manifest：slots 收敛 V2——仅 composer.status，条目 icon=gauge �
   assert.ok(m.extension.contributes.commands.some((c) => c.id === cmdId), `command 未声明: ${cmdId}`);
 });
 
-test("manifest：版本 0.2.0（部署缓存按版本刷新）；description 为 V2 文案（实时速率/额度窗口/24h 趋势）", () => {
+test("manifest：版本 0.2.1（部署缓存按版本刷新）；description 为 V2 文案（实时速率/额度窗口/24h 趋势）", () => {
   const m = readManifest();
   // 部署机制（§六 2026-11-23 实证）：运行时加载安装时缓存副本，版本 bump 是缓存刷新的唯一触发
-  assert.equal(m.version, "0.2.0");
+  assert.equal(m.version, "0.2.1");
   const d = m.description ?? "";
   assert.ok(d.includes("实时 token 速率"), "V2 文案应宣称实时速率");
   assert.ok(d.includes("额度窗口"), "V2 文案应宣称额度窗口");
@@ -99,7 +99,7 @@ test("marketplace 一致性：marketplace.json 版本与 plugin.json 对齐，�
   const market = JSON.parse(readFileSync(new URL("../marketplace.json", import.meta.url), "utf8"));
   const plugin = (market.plugins ?? []).find((p) => p.name === m.name);
   assert.ok(plugin, "marketplace.json 缺少 zpowerpack 条目");
-  // 部署机制以版本 bump 触发缓存刷新：市场条目版本不同步则 0.2.0 永远不生效
+  // 部署机制以版本 bump 触发缓存刷新：市场条目版本不同步则新版本永远不生效
   assert.equal(plugin.version, m.version, "marketplace 版本必须与 plugin.json 一致");
   const d = plugin.description ?? "";
   assert.ok(d.includes("实时 token 速率"), "市场描述应宣称实时速率");
@@ -1009,6 +1009,119 @@ test("activate：workbench 不可达降级——素条推给最近事件会话�
 });
 
 // ---------------------------------------------------------------------------
+// 三·b、context.onDidChange 跟手（0.2.1：聚焦会话切换模型/上下文变更 → 素条立即重推）
+// ---------------------------------------------------------------------------
+
+test("activate：context.onDidChange 跟手——上下文变更回调立即重推素条（不等下一拍），stop 时退订", async () => {
+  const now = 1732252927000;
+  const zhipuRow = {
+    providerId: "bigmodel-api",
+    name: "智谱",
+    windows: [
+      { type: "rolling-5h", percent: 73, used: 9.1e6, limit: 2.0e7, source: "official", nextResetMs: now + 7920000 },
+      { type: "weekly", percent: 41, used: null, limit: null, source: "official", nextResetMs: now + 187200000 },
+    ],
+    nextResetMs: now + 7920000,
+    percent: 73,
+    source: "official",
+  };
+  const kimiRow = {
+    providerId: "kimi-code-cn",
+    name: "Kimi",
+    windows: [
+      { type: "rolling-5h", percent: 12, used: null, limit: null, source: "official", nextResetMs: now + 3 * 86400000 },
+      { type: "monthly", percent: 27, used: null, limit: null, source: "official", nextResetMs: null },
+    ],
+    nextResetMs: now + 3 * 86400000,
+    percent: 12,
+    source: "official",
+  };
+  // 可变上下文：初始 null（回退最近请求供应商），变更后切到 Kimi——只有主动重推才能看到新文案
+  let selected = null;
+  let changeCb = null;
+  let disposed = 0;
+  const ctx = makeMockCtx();
+  ctx.workbench = { onDidChange: () => {}, visibleSessions: async () => ({ sessions: [{ sessionId: "sA", focused: true }] }) };
+  ctx.context = {
+    get: async () => selected,
+    onDidChange: (cb) => {
+      changeCb = cb;
+      return { dispose: () => { disposed++; } };
+    },
+  };
+  const deps = { ...fakeDeps(), fetchQuota: async () => [zhipuRow, kimiRow], now: () => now };
+  // 60s 间隔：只有激活首拍，回调后的重推不可能来自定时拍（隔离跟手通道）
+  const handle = await activate(ctx, { intervalMs: 60000, deps, log: () => {} });
+  try {
+    await new Promise((r) => setTimeout(r, 40)); // 首拍 + 可见会话初值落地
+    assert.equal(typeof changeCb, "function", "context.onDidChange 回调必须已登记");
+    // 事件驱动首推（基线）：上下文 null → 回退该会话最近请求供应商（智谱 5h 73%）
+    handle.onGenerateEvent(
+      { sessionId: "sA", requestId: "req-a", model: { providerId: "bigmodel-api", modelId: "glm-4.7" }, phase: "streaming", outputTokensPerSecond: 300 },
+      now + 2000,
+    );
+    await new Promise((r) => setTimeout(r, 30));
+    const mini = () => ctx.calls.slots.filter((s) => s.id === "zpowerpack-mini" && s.scope?.sessionId === "sA");
+    const before = mini().length;
+    assert.ok(before >= 1, "事件驱动会话素条已推送");
+    assert.equal(mini()[before - 1].patch.text, "300 tok/s · 5h 73%", "基线=上下文 null 回退最近请求供应商");
+    // 宿主上下文变更事件（声明实证载荷 {sessionId, revision}）→ 回调立即重推素条
+    selected = { model: { providerId: "kimi-code-cn", modelId: "kimi-k2", contextWindow: 128000 } };
+    changeCb({ sessionId: "sA", revision: 2 });
+    await new Promise((r) => setTimeout(r, 30));
+    assert.ok(mini().length > before, "context.onDidChange 回调必须触发素条重推（不得等下一拍）");
+    assert.equal(mini()[mini().length - 1].patch.text, "300 tok/s · 5h 12%", "重推取到新上下文模型选中的供应商额度");
+    // 退订登记：句柄进 disposers，stop 时 dispose 一次
+    handle.stop();
+    assert.equal(disposed, 1, "context.onDidChange 句柄应登记进 disposers 并在 stop 时退订");
+  } finally {
+    handle.stop();
+  }
+});
+
+test("activate：context.onDidChange Rx 对象形态（函数缺位时接住，回调同样触发素条排程）", async () => {
+  let rxCb = null;
+  const ctx = makeMockCtx();
+  ctx.context = {
+    get: async () => null,
+    onDidChange: {
+      subscribe: (cb) => {
+        rxCb = cb;
+        return () => {};
+      },
+    },
+  };
+  const handle = await activate(ctx, { intervalMs: 60000, deps: fakeDeps(), log: () => {} });
+  try {
+    assert.equal(typeof rxCb, "function", "Rx 对象形态（onDidChange.subscribe）应接住回调");
+  } finally {
+    handle.stop();
+  }
+});
+
+test("activate：context.onDidChange 绑定抛错 → 激活不失败且中文 warn 一次", async () => {
+  const ctx = makeMockCtx();
+  const logs = [];
+  ctx.context = {
+    get: async () => null,
+    onDidChange: () => {
+      throw new Error("宿主拒绝订阅");
+    },
+  };
+  const handle = await activate(ctx, { intervalMs: 60000, deps: fakeDeps(), log: (l) => logs.push(l) });
+  try {
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(ctx.calls.views.length, 1, "绑定失败不得中断激活（视图已注册）");
+    // 静默降级：不影响既有素条链路，仅一条中文 warn 留痕
+    const warns = logs.filter((l) => l.includes("context.onDidChange") && l.includes("不可达"));
+    assert.equal(warns.length, 1, "绑定失败须中文 warn 恰好一次: " + logs.join("|"));
+    assert.ok(warns[0].includes("宿主拒绝订阅"), "warn 应含宿主错误原文: " + warns[0]);
+  } finally {
+    handle.stop();
+  }
+});
+
+// ---------------------------------------------------------------------------
 // 四、bindOnGenerate 订阅绑定（Task 6 接线：候选序列与临时探测段一致，先成功者胜）
 // ---------------------------------------------------------------------------
 
@@ -1176,14 +1289,24 @@ test("动效契约：数字节点挂 300ms 过渡类；prefers-reduced-motion �
   );
 });
 
-test("取数与同步接线：display/sync 双注册资源；订阅 typeof 探测静默 + 1s 轮询兜底；10s 超时复位 + 失败中文提示", () => {
+test("取数与同步接线：display/sync 双注册资源；视图不主动订阅（未知形态探测已移除）+ 1s 轮询兜底；10s 超时复位 + 失败中文提示", () => {
   const html = readView();
   // 取数主通道 + 手动同步通道（注册资源 read 调用逐字 URI）
   assert.ok(html.includes('readResource("zpowerpack://display")'), "取数主通道必须读 display 注册资源");
   assert.ok(html.includes('readResource("zpowerpack://sync")'), "同步按钮必须读 sync 注册资源");
-  // 防御性双通道：订阅形态 typeof 探测（沙箱 window.zcode 暴露性真机校准点未证实）+ 轮询兜底常驻
-  assert.match(html, /typeof[^;]{0,80}subscribe/, "缺少订阅形态 typeof 探测");
+  // 0.2.1 真机首跑修复：三候选订阅形态未经真机证实（疑与桥面 "E is not a function" 报错相关）
+  // → 视图侧不再主动订阅；宿主 notify 只达已订阅者，无订阅者时 1s 轮询兜底保障数据新鲜度
+  assert.ok(!html.includes("trySubscribe"), "不得残留 trySubscribe（0.2.1 移除未知形态探测）");
+  assert.ok(!/\.subscribe\s*\(/.test(html), "视图不得调用任何订阅形态（宿主桥面形态未证实）");
   assert.match(html, /POLL_FALLBACK_MS\s*=\s*1000/, "缺少 POLL_FALLBACK_MS=1000 轮询兜底常量");
+  assert.match(html, /setInterval\(refresh, POLL_FALLBACK_MS\)/, "轮询兜底必须常驻（视图无订阅通道时的唯一新鲜度保障）");
+  // 0.2.1 真机证据链：失败文案附桥面键集——Object.keys(window.zcode) 安全取值（异常省略），截断 200 字符内
+  assert.match(html, /function zcodeKeysHint\(\)/, "缺少桥面键集摘要函数");
+  assert.match(html, /try \{\s*var keys = Object\.keys\(window\.zcode \|\| \{\}\);/, "键集摘要须安全取值 window.zcode（异常省略）");
+  assert.match(html, /" · zcode 键: \["/, "键集摘要文案须为「· zcode 键: [...]」形态");
+  assert.match(html, /hint\.length > 200 \? hint\.slice\(0, 200\)/, "键集摘要须截断 200 字符内（错误文案不得溢出遮罩）");
+  const hintCalls = [...html.matchAll(/\+ zcodeKeysHint\(\)/g)].length;
+  assert.ok(hintCalls >= 2, `两处失败文案（rejection handler 与同步 catch）均须追加键集摘要（实际 ${hintCalls} 处）`);
   // 同步按钮行为契约：拉取中禁用+旋转、10s 超时复位、失败文案逐字（视图侧唯一固定交互文案）
   assert.match(html, /SYNC_TIMEOUT_MS\s*=\s*10000/, "缺少 SYNC_TIMEOUT_MS=10000 超时复位常量");
   assert.match(html, /\.busy[^{]*\{[^}]*animation:\s*spin/, "拉取中旋转图标态缺失");
