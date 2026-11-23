@@ -175,6 +175,15 @@ test("事件键名契约：camelCase 载荷直录（Task 0 定案键名不一致
   assert.equal(snap.lastProviderId, "zhipu");
 });
 
+test("兜底：noteFallbackRow(null) 不抛错（row 缺失契约兜底）", () => {
+  const live = createLiveRate();
+  // requestTps 已容 null，completedAt 读取必须同样兜底：内部调用方虽已过滤，契约不得脆弱
+  assert.doesNotThrow(() => live.noteFallbackRow(null));
+  const snap = live.snapshot(1000);
+  assert.deepEqual(snap.fallback, { tps: null, completedAt: null }, "缺失行兜底为 null 值而非抛错");
+  assert.equal(snap.state, "idle");
+});
+
 test("兜底：noteFallbackRow 后 snapshot.fallback 有值，与流并存时流优先", () => {
   const live = createLiveRate();
   // 订阅不可达：服务层喂最新完成行（303 tokens / 2800ms → 108.21）

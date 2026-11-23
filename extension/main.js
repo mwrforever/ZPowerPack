@@ -51,6 +51,12 @@ const PERCENT_HISTORY_MAX = 30;
 const CONCLUSION_MIN_SAMPLES = 5;
 
 /**
+ * 当前激活的服务句柄（模块级单例）：宿主停用/卸载只调用 module.deactivate() 且忽略
+ * activate 的返回值（宿主源码实证），因此退场通道只能靠模块级记忆。
+ */
+let activeService = null;
+
+/**
  * 新建服务状态（tickV2/事件入口的唯一可变载体，快照全部数据源）。
  * @returns {{cursor: number|null, buckets: Map, live: object, subagentIds: Set<string>,
  *           sessionsAt: number, quotaRows: object[], quotaAt: number,
@@ -226,7 +232,8 @@ export async function tickV2(state, deps) {
 /**
  * 官方生成事件入口工厂（activate 在 Task 6 绑定到宿主 models.onDidGenerate 订阅）。
  * live.onEvent 恒执行（流状态机直录官方推送值，节流不吞事件）；快照重建与 deliver
- * 按 EVENT_THROTTLE_MS 节流：一秒内多事件仅一次重建（事件风暴护栏，60s 拍兜底收尾）。
+ * 按 EVENT_THROTTLE_MS 节流：一秒内多 streaming 事件仅一次重建（事件风暴护栏，60s 拍兜底收尾）；
+ * final 不受节流约束（结束态必须立即上屏，否则「生成中」最长滞留 60s）。
  * @param {object} state createState 产物（读取 quotaRows/buckets/percentHistory 组装快照）
  * @param {{deliver?: Function, snapshotPath?: string, log?: Function}} deps 送达通道
  * @returns {(ev: object, now?: number) => void} 事件处理函数（now 缺省取宿主到达时刻）
@@ -239,8 +246,10 @@ export function createOnGenerateEvent(state, deps = {}) {
     try {
       // 事件恒直录流状态机（官方推送值原样，无平滑）——subagentIds 由 60s 拍刷新
       state.live.onEvent(ev, now, state.subagentIds);
-      // 距上次事件型 deliver < 1s → 只更新 live，不重建快照
-      if (now - lastDeliverAt < EVENT_THROTTLE_MS) return;
+      // final 绕过节流：生成结束几乎总落在上次事件型 deliver 的 1s 内，若被吞则视图
+      // 会继续显示「生成中 + 旧速率」直到下一拍（最长 60s），正落「看起来在动但数据没动」反目标
+      const isFinal = ev?.phase === "final";
+      if (!isFinal && now - lastDeliverAt < EVENT_THROTTLE_MS) return;
       lastDeliverAt = now;
       assembleAndDeliver(state, state.quotaRows ?? [], now, deps);
     } catch (e) {
@@ -518,8 +527,9 @@ const EMPTY_DISPLAY = toDisplayModelV2(
  */
 function sessionIdOf(source) {
   const scope = source?.scope;
-  if (scope?.kind === "session" && typeof scope.sessionId === "string") return scope.sessionId;
-  if (typeof source?.sessionId === "string") return source.sessionId;
+  // 空串不是有效会话（会作过滤键把面板速率清空，并与全局素条去重键 "" 相撞）
+  if (scope?.kind === "session" && typeof scope.sessionId === "string" && scope.sessionId.length > 0) return scope.sessionId;
+  if (typeof source?.sessionId === "string" && source.sessionId.length > 0) return source.sessionId;
   return null;
 }
 
@@ -666,10 +676,11 @@ export async function activate(ctx, opts = {}) {
     const scopeKey = typeof scope?.sessionId === "string" ? scope.sessionId : "";
     const key = `${strip.text}|${strip.tooltip}`;
     if (lastStripKeys.get(scopeKey) === key) return;
-    lastStripKeys.set(scopeKey, key);
     try {
       // 第三参=会话作用域（宿主源码实证；真机形态不符由探测段诊断揭示后校准）
       ctx.slots.update("zpowerpack-mini", { text: strip.text, tooltip: strip.tooltip, visible: true }, scope);
+      // 宿主接受后才记去重键：越界/校验拒绝不得写键，否则同值永不重试（V1 素条静默消失根因防复发）
+      lastStripKeys.set(scopeKey, key);
     } catch (e) {
       log(`[ZPowerPack] 素条推送失败（${e?.name || "异常"}）：${e?.message ?? ""}`);
     }
@@ -758,9 +769,12 @@ export async function activate(ctx, opts = {}) {
     const direct = sessionIdOf(callInfo);
     const viewKey = direct === null ? viewKeyOf(callInfo) : null;
     const sessionId = direct ?? (viewKey === null ? null : (viewScope.get(viewKey) ?? null));
-    // 无会话归属走现成的全局缓存（避免每读一次重建）；会话口径按需过滤速率流
-    if (sessionId === null) return latestDisplay;
-    return toDisplayModelV2(latestSnapshot, Date.now(), { sessionId, reqSession });
+    // 每次读取按当前时刻重算：相对时间文案（「完成于 Xs 前」/重置倒计时）不得冻结到下一拍；
+    // toDisplayModelV2 是纯函数微秒级，无需缓存。latestDisplay 仅留给首拍前空态与素条全局降级。
+    const now = Date.now();
+    return sessionId === null
+      ? toDisplayModelV2(latestSnapshot, now)
+      : toDisplayModelV2(latestSnapshot, now, { sessionId, reqSession });
   };
 
   try {
@@ -917,8 +931,23 @@ export async function activate(ctx, opts = {}) {
     viewScope.clear();
   };
 
+  // 模块级记忆服务句柄：宿主停用/卸载经 deactivate() 退场（只调本函数且忽略 activate 返回值）
+  activeService = { stop };
   // 返回包装后的事件入口（测试直驱可验证会话素条链路）；宿主不消费返回值
   return { stop, onGenerateEvent };
+}
+
+/**
+ * 停用入口（宿主生命周期契约）：停 60s 拍、统一退订本激活登记的宿主订阅、清视图推送句柄。
+ * 宿主在停用/卸载/更新插件时只调用本函数（无参）且忽略 activate 返回值——必须经模块级
+ * activeService 找回句柄；调用后置 null 使重复调用幂等（不重复退订、不误停新激活实例）。
+ * @returns {void} 无返回值（宿主不消费结果）；内部各步失败均已被 stop 内部捕获记日志
+ */
+export function deactivate() {
+  const service = activeService;
+  // 先清引用再停：即使 stop 过程异常也不留下半死句柄供下次误用
+  activeService = null;
+  service?.stop();
 }
 
 /* ============================================================================

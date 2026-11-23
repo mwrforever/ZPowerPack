@@ -3,8 +3,9 @@
  *
  * V6 调研裁决（覆盖计划中的日历对齐假设）：智谱周窗口是订阅日锚定的 7 天周期、重置卡会即时改变
  * 重置时间、Kimi 月窗口疑似订阅锚定、OpenCode 未文档化——重置时刻一律以官方接口返回值为唯一权威；
- * 本模块的 windowBounds 仅在两种场景使用：① 分子聚合的本地窗口；② 官方接口不可达时的兜底展示
- * （trailing 窗口，界面必须注明"以官方重置时间为准"）。
+ * V2 收窄后本模块的 windowBounds 仅服务两种场景：① 5h 兜底分子聚合的本地窗口；
+ * ② 官方接口不可达时窗口边界的近似（trailing 窗口）。周/月已不做本地分子（24h 底座对
+ * 7d/30d 天然算不准），weekly/monthly 分支保留为规则表能力，当前仅测试覆盖。
  */
 
 /**
@@ -25,12 +26,12 @@ export function windowBounds(rule, now, anchors = {}) {
         ? { startMs: anchor - 5 * 3600000, endMs: anchor, nextResetMs: anchor }
         : { startMs: now - 5 * 3600000, endMs: now, nextResetMs: now };
     case "weekly":
-      // 订阅日锚定 7 天周期：有官方锚定回推完整周期；无锚定 trailing 7 天兜底
+      // 规则表保留、当前仅测试覆盖（V2 已删周本地分子）：订阅日锚定 7 天周期，无锚定 trailing 7 天兜底
       return anchor !== null
         ? { startMs: anchor - 7 * 86400000, endMs: anchor, nextResetMs: anchor }
         : { startMs: now - 7 * 86400000, endMs: now, nextResetMs: null };
     case "monthly":
-      // 月窗口周期长不可本地推知（28~31 天），统一按 30 天近似
+      // 规则表保留、当前仅测试覆盖（V2 已删月本地分子）：周期长不可本地推知，统一按 30 天近似
       return anchor !== null
         ? { startMs: anchor - 30 * 86400000, endMs: anchor, nextResetMs: anchor }
         : { startMs: now - 30 * 86400000, endMs: now, nextResetMs: null };

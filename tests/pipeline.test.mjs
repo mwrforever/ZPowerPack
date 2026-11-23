@@ -367,6 +367,28 @@ test("事件风暴：一秒内多事件仅一次快照重建与 deliver（EVENT_
   assert.equal(delivered[1].rate.totalTps, 260);
 });
 
+test("final 绕过节流：streaming@t0 + final@t0+300 → 两次 deliver，第二次 state=recent", () => {
+  const t0 = 1732252927000;
+  const state = createState();
+  const delivered = [];
+  const onGenerateEvent = createOnGenerateEvent(state, { deliver: (s) => delivered.push(s), log: () => {} });
+  const ev = (phase, tps) => ({
+    sessionId: "s1",
+    requestId: "r1",
+    model: { providerId: "p1", modelId: "glm-4.7" },
+    phase,
+    outputTokensPerSecond: tps,
+  });
+
+  onGenerateEvent(ev("streaming", 428), t0);
+  // final 落在 1s 节流窗口内：必须立即送达，否则视图「生成中」滞留到下一拍（最长 60s）
+  onGenerateEvent(ev("final", 415), t0 + 300);
+  assert.equal(delivered.length, 2, "final 不得被事件节流吞掉");
+  assert.equal(delivered[1].rate.state, "recent", "final 后快照立即转 recent");
+  assert.equal(delivered[1].rate.streams.length, 0, "final 收流后不得残留活跃流");
+  assert.equal(delivered[1].rate.lastFinal.tps, 415, "final 末值立即上屏");
+});
+
 test("防重入：慢周期进行中不叠加并发拉取（V1 根因护栏保留）", async () => {
   let inFlight = 0;
   let maxInFlight = 0;

@@ -94,6 +94,19 @@ test("manifest：版本 0.2.0（部署缓存按版本刷新）；description 为
   assert.ok(!d.includes("速度/健康/时段"), "不得再宣称速度/健康/时段统计");
 });
 
+test("marketplace 一致性：marketplace.json 版本与 plugin.json 对齐，描述为 V2 文案", () => {
+  const m = readManifest();
+  const market = JSON.parse(readFileSync(new URL("../marketplace.json", import.meta.url), "utf8"));
+  const plugin = (market.plugins ?? []).find((p) => p.name === m.name);
+  assert.ok(plugin, "marketplace.json 缺少 zpowerpack 条目");
+  // 部署机制以版本 bump 触发缓存刷新：市场条目版本不同步则 0.2.0 永远不生效
+  assert.equal(plugin.version, m.version, "marketplace 版本必须与 plugin.json 一致");
+  const d = plugin.description ?? "";
+  assert.ok(d.includes("实时 token 速率"), "市场描述应宣称实时速率");
+  assert.ok(d.includes("额度窗口"), "市场描述应宣称额度窗口");
+  assert.ok(!d.includes("速度/健康/时段"), "市场描述不得再宣称 V2 已退役的速度/健康/时段统计");
+});
+
 test("manifest：main 为插件根内相对路径（不得绝对/含 ..）", () => {
   const main = readManifest().extension.main;
   assert.ok(!/^([a-zA-Z]:|[\\/])/.test(main), "main 不得为绝对路径");
@@ -303,6 +316,45 @@ test("素条 tooltip ≤200：三窗口+重置+主子速率全量且不截断关
   assert.equal(toDisplayModelV2(emptyV2Snapshot(now), now).strip.tooltip, "ZPowerPack 用量速览 · 点击打开看板");
 });
 
+test("素条长度兜底：超长 providerName 截断为 text≤40/tooltip≤200 且非空（V1 素条拒收根因防复发）", () => {
+  const now = 1732252927000;
+  const snap = makeV2Snapshot(now);
+  // 用户自定义供应商名可远超 25 字符（text 契约 40 的临界点）；此处取 200+ 同时压 tooltip
+  const longName = "OpenCode Go Messages 企业年度旗舰订阅专用实例" + "超长供应商名称".repeat(20);
+  snap.quota = [
+    {
+      providerId: "opencode-go",
+      name: longName,
+      windows: [
+        { type: "rolling-5h", percent: 86, used: null, limit: null, source: "official", nextResetMs: now + 21600000 },
+        { type: "weekly", percent: 57, used: null, limit: null, source: "official", nextResetMs: now + 108000000 },
+        { type: "monthly", percent: 28, used: null, limit: null, source: "official", nextResetMs: now + 20 * 86400000 },
+      ],
+      nextResetMs: now + 21600000,
+      percent: 86,
+      source: "official",
+    },
+  ];
+  snap.rate = {
+    state: "idle",
+    streams: [],
+    totalTps: 0,
+    subTps: 0,
+    lastEventAt: now - 400000,
+    lastProviderId: "opencode-go",
+    lastFinal: { modelId: "glm-4.7", tps: 300, outputTokens: 1234, at: now - 400000 },
+    fallback: null,
+  };
+  const dm = toDisplayModelV2(snap, now);
+  // 宿主插槽硬校验 text≤40/tooltip≤200：越界会整条拒收（V1 provider id 超 40 导致素条从未显示）
+  assert.ok(dm.strip.text.length > 0, "截断后不得为空");
+  assert.ok(dm.strip.text.length <= 40, `素条 text 超 40 字符（插槽契约）: ${dm.strip.text.length}`);
+  assert.ok(dm.strip.tooltip.length > 0, "tooltip 截断后不得为空");
+  assert.ok(dm.strip.tooltip.length <= 200, `素条 tooltip 超 200 字符（插槽契约）: ${dm.strip.tooltip.length}`);
+  // 截断保留厂商名开头（优先砍额度段，不丢主体身份）
+  assert.ok(dm.strip.text.startsWith(longName.slice(0, 20)), "截断应保留厂商名前缀: " + dm.strip.text);
+});
+
 test("会话作用域素条：focus 段只取该会话流与聚焦供应商额度行；四态逐字；全局流不串扰", () => {
   const now = 1732252927000;
   const base = makeV2Snapshot(now);
@@ -456,6 +508,49 @@ test("空快照全链不抛错：素条=待机、面板各空态", () => {
   assert.deepEqual(dm.panel.trend.points, []);
   assert.equal(dm.panel.trend.footText, "近 24 小时 · 暂无消耗");
   assert.equal(dm.panel.conclusion.text, "消耗速度尚不足以推算");
+});
+
+test("额度不可用：厂商行状态句「官方接口不可用」、ringPct=null、素条窗口段「额度不可用」", () => {
+  const now = 1732252927000;
+  const snap = makeV2Snapshot(now);
+  // keyless/断网形态：官方失败 → 全部窗口 percent=null、source=unavailable（V2 最常见的失败态）
+  snap.quota = [
+    {
+      providerId: "bigmodel-api",
+      name: "智谱",
+      windows: [
+        { type: "rolling-5h", percent: null, used: 620, limit: null, source: "unavailable", nextResetMs: null },
+        { type: "weekly", percent: null, used: null, limit: null, source: "unavailable", nextResetMs: null },
+      ],
+      nextResetMs: null,
+      percent: null,
+      source: "unavailable",
+    },
+  ];
+  const dm = toDisplayModelV2(snap, now);
+  // 厂商行：空环是缺口 0% 的视觉编码——ringPct 必须为 null，状态句不得再伪装成「滚动窗口」
+  const v = dm.panel.vendors[0];
+  assert.equal(v.ringPct, null, "官方失败时环百分比必须为 null（视图据此不画弧）");
+  assert.equal(v.statusText, "官方接口不可用", "额度失败必须给官方接口不可用状态句");
+  assert.equal(v.percents[0].pct, null, "窗口百分比未知，不得编造 0");
+  // 素条生成中：速率保留，水位段给「额度不可用」（信息悬崖修复）
+  assert.equal(dm.strip.text, "428 tok/s · 额度不可用");
+  // 素条空闲：厂商名保留，窗口段给「额度不可用」
+  snap.rate = {
+    state: "idle",
+    streams: [],
+    totalTps: 0,
+    subTps: 0,
+    lastEventAt: now - 400000,
+    lastProviderId: "bigmodel-api",
+    lastFinal: { modelId: "glm-4.7", tps: 300, outputTokens: 1234, at: now - 400000 },
+    fallback: null,
+  };
+  assert.equal(toDisplayModelV2(snap, now).strip.text, "智谱 额度不可用");
+  // 会话作用域同口径（focus 段）：该会话模型选择供应商官方失败
+  snap.rate = makeV2Snapshot(now).rate;
+  const focused = { ...snap, focus: { sessionId: "sA", modelId: "glm-4.7", providerId: "bigmodel-api", quotaRow: snap.quota[0], streams: [] } };
+  assert.equal(toDisplayModelV2(focused, now).strip.text, "智谱 额度不可用");
 });
 
 test("界面文案禁 P50/P95（沿用护栏）", () => {
@@ -703,6 +798,40 @@ test("activate：display read 按会话作用域过滤面板速率（callInfo.sc
     // ⑤ 未知视图标识 / 非会话 scope → 全局口径（不猜会话归属）
     assert.equal(JSON.parse(read({ view: { id: "v-unknown" } })).panel.rate.streams.length, 2);
     assert.equal(JSON.parse(read({ scope: { kind: "workspace" } })).panel.rate.streams.length, 2);
+    // ⑥ 空串会话 id 不是有效归属（M15）：不得作为过滤键清空面板速率
+    assert.equal(JSON.parse(read({ scope: { kind: "session", sessionId: "" } })).panel.rate.streams.length, 2, "空串 scope.sessionId 必须走全局口径");
+    assert.equal(JSON.parse(read({ sessionId: "" })).panel.rate.streams.length, 2, "空串顶层 sessionId 必须走全局口径");
+    ctx.calls.views[0].def.onDidOpen({ view: { id: "v-empty" }, scope: { kind: "session", sessionId: "" }, notify: () => {}, onDidClose: () => {} });
+    assert.equal(JSON.parse(read({ view: { id: "v-empty" } })).panel.rate.streams.length, 2, "空串会话不得写入视图归属映射");
+  } finally {
+    handle.stop();
+  }
+});
+
+test("display 读取按当前时刻重算相对时间（全局口径不得返回冻结缓存）", async () => {
+  const ctx = makeMockCtx();
+  const deps = { ...fakeDeps(), now: () => 1732252927000 };
+  // 60s 间隔：只跑激活首拍，避免拍子插入干扰相对时间断言
+  const handle = await activate(ctx, { intervalMs: 60000, deps });
+  try {
+    await new Promise((r) => setTimeout(r, 40)); // 首拍送达，latestSnapshot 就绪
+    const t0 = Date.now();
+    handle.onGenerateEvent(
+      { sessionId: "s1", requestId: "r1", model: { providerId: "bigmodel-api", modelId: "glm-4.7" }, phase: "streaming", outputTokensPerSecond: 428 },
+      t0 - 1000,
+    );
+    handle.onGenerateEvent(
+      { sessionId: "s1", requestId: "r1", model: { providerId: "bigmodel-api", modelId: "glm-4.7" }, phase: "final", outputTokensPerSecond: 415 },
+      t0,
+    );
+    const read = ctx.calls.views[0].def.resources["zpowerpack://display"].read;
+    const first = JSON.parse(read()).panel.rate.lastActivityText;
+    // 等 1.2s 再读同一快照：相对时间文案必须前进（缓存对象会让「完成于 0s 前」冻结一分钟）
+    await new Promise((r) => setTimeout(r, 1200));
+    const second = JSON.parse(read()).panel.rate.lastActivityText;
+    assert.match(first, /^完成于 \d+s 前$/, "recent 态应给「完成于 Xs 前」: " + first);
+    assert.match(second, /^完成于 \d+s 前$/, "recent 态应给「完成于 Xs 前」: " + second);
+    assert.notEqual(second, first, "相对时间文案必须随读取时刻前进（不得冻结到下一拍）");
   } finally {
     handle.stop();
   }
@@ -724,6 +853,65 @@ test("activate：stop 统一退订宿主订阅——函数句柄与对象句柄�
   handle.stop();
   assert.equal(generateDisposed, 1, "重复 stop 不得重复退订");
   assert.equal(workbenchDisposed, 1, "重复 stop 不得重复退订");
+});
+
+test("deactivate：宿主停用入口停 60s 拍、退订各一次、清视图推送句柄", async () => {
+  // 宿主只调 module.deactivate() 且忽略 activate 返回值（C1）：模块级句柄是唯一退场通道
+  const { deactivate } = await import("../extension/main.js");
+  assert.equal(typeof deactivate, "function", "插件必须导出 deactivate（否则停用/卸载后服务永不退场）");
+  const ctx = makeMockCtx();
+  let generateDisposed = 0;
+  let workbenchDisposed = 0;
+  // 两种宿主句柄形态：onDidGenerate 返回函数；workbench.onDidChange 返回 {dispose}
+  ctx.models = { onDidGenerate: () => () => { generateDisposed++; } };
+  ctx.workbench = { onDidChange: () => ({ dispose: () => { workbenchDisposed++; } }) };
+  let newFetches = 0;
+  const deps = {
+    ...fakeDeps(),
+    fetchNew: async (cursor) => {
+      newFetches++;
+      return { rows: [], nextCursor: cursor };
+    },
+  };
+  const handle = await activate(ctx, { intervalMs: 5, deps });
+  await new Promise((r) => setTimeout(r, 40));
+  // 打开视图：deactivate 后 viewPort 必须清空，否则仍在向宿主已销毁的视图推送
+  const notifyCalls = [];
+  ctx.calls.views[0].def.onDidOpen({ notify: (uri) => notifyCalls.push(uri), onDidClose: () => {} });
+  deactivate();
+  // 等在飞拍落地（stop 只清定时器，不打断已开始的拍），再取停拍基线
+  await new Promise((r) => setTimeout(r, 40));
+  const fetchAtStop = newFetches;
+  const notifyAtStop = notifyCalls.length;
+  assert.equal(generateDisposed, 1, "生成事件订阅应在 deactivate 时退订一次");
+  assert.equal(workbenchDisposed, 1, "workbench 订阅应在 deactivate 时退订一次");
+  // 事件入口仍可被直驱，但视图句柄已清：不得再 notify 已销毁视图
+  handle.onGenerateEvent(
+    { sessionId: "s1", requestId: "r1", model: { providerId: "bigmodel-api", modelId: "glm-4.7" }, phase: "streaming", outputTokensPerSecond: 200 },
+    Date.now(),
+  );
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(newFetches, fetchAtStop, "deactivate 后 60s 拍不得再触发（interval 已清）");
+  assert.equal(notifyCalls.length, notifyAtStop, "deactivate 后不得再向已销毁视图推送");
+  // 重复 deactivate（停用 + 卸载双路径）不得重复退订或抛错
+  assert.doesNotThrow(() => deactivate());
+  assert.equal(generateDisposed, 1, "重复 deactivate 不得重复退订");
+  assert.equal(workbenchDisposed, 1, "重复 deactivate 不得重复退订");
+});
+
+test("activate：素条推送失败不记去重键——宿主拒收后下一拍必须重试", async () => {
+  const ctx = makeMockCtx();
+  let attempts = 0;
+  // 模拟宿主插槽校验拒绝（V1 长名越界形态）：抛出后去重键不得写入，否则同值永不重试
+  ctx.slots = { update: () => { attempts++; throw new Error("插槽校验拒绝"); } };
+  const deps = { ...fakeDeps(), now: () => 1732252927000 };
+  const handle = await activate(ctx, { intervalMs: 5, deps, log: () => {} });
+  try {
+    await new Promise((r) => setTimeout(r, 60));
+    assert.ok(attempts >= 2, `首次推送失败后不得写入去重键，后续拍必须重试（实际 ${attempts} 次）`);
+  } finally {
+    handle.stop();
+  }
 });
 
 test("activate：素条按会话分别推送——workbench 可见会话各得本会话值，slots.update 第三参传 {sessionId}", async () => {
@@ -929,7 +1117,7 @@ test("视图自包含：无外链 script、零外部 URL 引用；五渲染锚�
   assert.doesNotThrow(() => new vm.Script(scripts[0]), "内联脚本必须通过语法编译");
 });
 
-test("视图健壮性：panel.rate/trend 缺失防御；render 抛错不提前隐藏遮罩；取数 inFlight 护栏", () => {
+test("视图健壮性：panel.rate/trend 缺失防御；render 抛错不提前隐藏遮罩；取数 inFlight 双路径复位", () => {
   const html = readView();
   // 段缺失防御：渲染函数入口把入参归一为空对象，缺失段退化为空态而非抛错
   assert.match(html, /function renderRate\(rate\) \{\s*rate = rate \|\| \{\};/, "renderRate 未对 rate 缺失做防御");
@@ -940,9 +1128,31 @@ test("视图健壮性：panel.rate/trend 缺失防御；render 抛错不提前�
   assert.ok(conclusionIdx > 0 && bootHideIdx > conclusionIdx, "遮罩隐藏必须在结论句渲染之后（抛错时不得错误隐藏）");
   // refresh 成功分支 try/catch：渲染异常不得吞掉首帧遮罩提示
   assert.match(html, /readDisplay\(\)\.then\(function \(dm\) \{\s*try \{[\s\S]*?render\(dm\);[\s\S]*?\} catch/, "refresh 成功分支缺少渲染 try/catch");
-  // 取数 inFlight 护栏：1s 轮询 + 订阅 + sync 共用入口，在飞时跳过并 finally 复位
+  // 取数 inFlight 护栏：1s 轮询 + 订阅 + sync 共用入口，在飞时跳过并复位
   assert.match(html, /if \(inFlight\) return;/, "刷新入口缺少 inFlight 护栏");
   assert.match(html, /\.finally\(function \(\) \{ inFlight = false; \}\)/, "inFlight 必须在 finally 复位");
+  // 同步抛错路径（I6）：readDisplay/readResource 同步 throw 时 finally 未注册，必须在 catch 复位
+  assert.match(html, /try \{\s*(?:\/\/[^\n]*\n\s*)*readDisplay\(\)\.then\(/, "readDisplay 必须在 try 中调用（同步抛错不得越过复位）");
+  assert.match(
+    html,
+    /try \{\s*(?:\/\/[^\n]*\n\s*)*readDisplay\(\)\.then\([\s\S]*?\} catch \(e\) \{\s*(?:\/\/[^\n]*\n\s*)?inFlight = false;/,
+    "同步抛错必须在 catch 中复位 inFlight（防轮询永久锁死）",
+  );
+});
+
+test("额度不可用视图契约：ringPct 为 null 时不画弧，环底降透明度（空环不得读成 0%）", () => {
+  const html = readView();
+  assert.match(html, /var hasPct = typeof v\.ringPct === "number";/, "视图须显式区分 ringPct 缺失（不得按 0 画弧）");
+  assert.match(html, /var ring = hasPct\s*\?/, "环形弧只能由 hasPct 分支生成（null 时不画弧）");
+  assert.match(html, /ring-empty/, "缺额度时环底应降透明度（未知态与 0% 区分）");
+});
+
+test("视图失败态：缺 panel 段写「数据不可用」文案；启动后渲染异常 console.error 留痕", () => {
+  const html = readView();
+  // 载荷整体畸形（缺 panel 段）：不得静默 return 让遮罩永停「正在连接」
+  assert.match(html, /if \(!dm \|\| !dm\.panel\) \{[\s\S]*?数据不可用/, "缺 panel 段必须回写数据不可用文案");
+  // boot 之后的渲染异常需 console.error 供真机开发者工具定位（失败不假动：画面保持最后真值）
+  assert.match(html, /console\.error\("\[看板\] 渲染失败"/, "渲染异常必须 console.error 留痕");
 });
 
 test("动效契约：数字节点挂 300ms 过渡类；prefers-reduced-motion 全关；仅呼吸圆点与同步旋转两枚功能动画", () => {

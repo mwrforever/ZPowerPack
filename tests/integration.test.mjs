@@ -215,7 +215,8 @@ test("集成：真实 schema db + provider 夹具 → activate 全链 → 快照
 
   // ---- ⑤ 注册资源：V2 展示模型端到端可读（真数据绑定） ----
   const display = JSON.parse(calls.views[0].def.resources["zpowerpack://display"].read({ view: {} }));
-  assert.equal(display.strip.text, "428 tok/s", "事件驱动素条=官方推送速率（无百分比水位不编造）");
+  // 官方失败（keyless）时速率保留、额度段给「额度不可用」——空环不得被读成 0 用量
+  assert.equal(display.strip.text, "428 tok/s · 额度不可用", "官方失败时素条须标注额度不可用（不编造水位）");
   assert.equal(display.panel.rate.stateText, "生成中");
   assert.equal(display.panel.rate.totalText, "428 tok/s");
   assert.equal(display.panel.vendors.length, 3, "三家厂商行全出");
@@ -239,7 +240,8 @@ test("集成：真实 schema db + provider 夹具 → activate 全链 → 快照
   for (const v of display.panel.vendors) {
     assert.ok(v.ringPct === null || typeof v.ringPct === "number", "ringPct 可空或数值");
     assert.match(v.ringColor, /^#[0-9a-f]{6}$/i, "环色为 hex 色值（stroke-dasharray 环直渲）");
-    assert.ok(v.statusText === null || typeof v.statusText === "string", "状态句可空或字符串（无窗口实例为 null）");
+    // keyless 夹具=官方失败形态：状态句必须是「官方接口不可用」，不得伪装成滚动窗口
+    assert.equal(v.statusText, "官方接口不可用", `官方失败须给状态句: ${v.name}`);
     assert.ok(v.subText === null || typeof v.subText === "string", "副行可空或字符串");
     // 百分比枚举必须覆盖实例全部窗口（OpenCode 三枚真钉住，少一枚即视图丢窗口）
     const quotaRow = snap.quota.find((q) => q.name === v.name);
@@ -299,7 +301,7 @@ test("集成：真实 schema db + provider 夹具 → activate 全链 → 快照
   // ---- ⑩ 会话作用域素条（2026-11-23 修订 #1）：事件按 sessionId 过滤，slots.update 第三参推给聚焦会话 ----
   const scoped = calls.slots.filter((s) => s.id === "zpowerpack-mini" && s.scope?.sessionId === "sess-root");
   assert.ok(scoped.length >= 1, "聚焦会话应收到作用域素条");
-  assert.equal(scoped[scoped.length - 1].patch.text, "428 tok/s", "会话素条=该会话流速率（无百分比水位不编造）");
+  assert.equal(scoped[scoped.length - 1].patch.text, "428 tok/s · 额度不可用", "官方失败时速率保留、额度段给不可用");
   // tooltip 额度头=聚焦会话当前模型选择供应商（修订 #2，context.get mock）的 quota 行
   assert.equal(scoped[scoped.length - 1].patch.tooltip, "智谱 GLM Coding · 主 428 tok/s · 点击查看详情");
 

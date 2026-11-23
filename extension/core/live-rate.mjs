@@ -130,7 +130,8 @@ export function createLiveRate() {
      * @param {object} row db-reader 输出的 camelCase 完成行
      */
     noteFallbackRow(row) {
-      fallback = { tps: requestTps(row), completedAt: row.completedAt };
+      // requestTps 已容 null；completedAt 同样用可选链兜底，row 缺失时置 null 而非抛错
+      fallback = { tps: requestTps(row), completedAt: row?.completedAt ?? null };
     },
   };
 }

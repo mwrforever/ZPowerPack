@@ -117,8 +117,8 @@ export function trendPoints(buckets, now) {
  *
  * @param {Map} buckets 桶结构（只读，不修改）
  * @param {string} providerId 目标 provider（额度按 provider 维度兜底）
- * @param {number} startMs 窗口起点 epoch 毫秒（含）
- * @param {number} endMs 窗口终点 epoch 毫秒（含）
+ * @param {number} startMs 窗口起点 epoch 毫秒（边界按桶交集判定，整桶计入口径见上）
+ * @param {number} endMs 窗口终点 epoch 毫秒（同上）
  * @returns {{in: number, out: number, reqs: number}} 覆盖桶整桶之和；
  *          未知 provider 或无覆盖桶时返回零值，不抛错
  */

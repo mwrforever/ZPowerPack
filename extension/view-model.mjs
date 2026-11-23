@@ -15,6 +15,10 @@ const CORAL = "#ff8f6b";
 /** 迷你条/水位行的窗口短名 */
 const WINDOW_SHORT = { "rolling-5h": "5h", weekly: "周", monthly: "月" };
 
+/** 素条插槽硬契约（宿主 schema 校验，越界整条拒收）：text≤40 / tooltip≤200 */
+const STRIP_TEXT_MAX = 40;
+const STRIP_TOOLTIP_MAX = 200;
+
 /**
  * 通用数字格式：1 位小数并去掉尾随 0（舞台巨字口径：428.6、300）。
  * @param {number|null|undefined} n 数值
@@ -161,11 +165,26 @@ function stripOf(snap, now) {
   const seg = snap?.focus ?? null;
   if (seg) {
     // 会话作用域：流与额度行已由 activate 按会话备好，这里只做文案映射（纯函数可 TDD）
-    return stripOfSegments(Array.isArray(seg.streams) ? seg.streams : [], seg.quotaRow ?? null, now);
+    return clampStrip(stripOfSegments(Array.isArray(seg.streams) ? seg.streams : [], seg.quotaRow ?? null, now));
   }
   // 全局口径：有流即 live（live-rate snapshot 契约保证 state=live ⟺ streams 非空，双重判定冗余保留）
   const streams = Array.isArray(snap?.rate?.streams) ? snap.rate.streams : [];
-  return stripOfSegments(snap?.rate?.state === "live" ? streams : [], focusQuotaOf(snap), now);
+  return clampStrip(stripOfSegments(snap?.rate?.state === "live" ? streams : [], focusQuotaOf(snap), now));
+}
+
+/**
+ * 素条出口长度兜底：宿主对 composer.status 插槽 text≤40/tooltip≤200 是硬校验，越界会
+ * 整条拒收（V1 provider id 超 40 导致素条从未显示的根因）。providerName 由用户自定义，
+ * 文案拼接后可能越界——出口统一截断加省略号；段序保证速率与厂商名在前，截断自然
+ * 优先牺牲尾部的额度窗口段。
+ * @param {{text: string, tooltip: string}} strip 素条文案
+ * @returns {{text: string, tooltip: string}} 长度合规的素条文案
+ */
+function clampStrip(strip) {
+  return {
+    text: strip.text.length > STRIP_TEXT_MAX ? strip.text.slice(0, STRIP_TEXT_MAX - 1) + "…" : strip.text,
+    tooltip: strip.tooltip.length > STRIP_TOOLTIP_MAX ? strip.tooltip.slice(0, STRIP_TOOLTIP_MAX - 1) + "…" : strip.tooltip,
+  };
 }
 
 /**
@@ -181,10 +200,13 @@ function stripOfSegments(streams, focus, now) {
     const mainTps = streams.reduce((s, x) => (x?.isSub ? s : s + (x?.tps ?? 0)), 0);
     const subTps = streams.reduce((s, x) => (x?.isSub ? s + (x?.tps ?? 0) : s), 0);
     const rateText = subTps > 0 ? `${fmt1(mainTps)}+${fmt1(subTps)}` : fmt1(mainTps);
-    // 水位段：焦点厂商首窗口（额度契约排序，rolling-5h 在首）；无额度数据时省略，不编造水位
+    // 水位段：焦点厂商首窗口（额度契约排序，rolling-5h 在首）；无官方百分比（断网/无 key/限流）
+    // 时给「额度不可用」——静默省略会让空环被读成 0% 用量，违背数据诚实纪律
     const headWin = (focus?.windows ?? [])[0] ?? null;
     const headPct = typeof headWin?.percent === "number" ? Math.round(headWin.percent) : null;
-    const head = headPct === null ? null : `${WINDOW_SHORT[headWin.type] ?? headWin.type} ${headPct}%`;
+    let head = null;
+    if (headPct !== null) head = `${WINDOW_SHORT[headWin.type] ?? headWin.type} ${headPct}%`;
+    else if (headWin !== null) head = "额度不可用";
     const text = head === null ? `${rateText} tok/s` : `${rateText} tok/s · ${head}`;
     // 速率段：单流「主 428 tok/s」；并行「主 428 · 子 96 tok/s（N 路并行）」
     const rateSeg = subTps > 0 ? `主 ${fmt1(mainTps)} · 子 ${fmt1(subTps)} tok/s（${streams.length} 路并行）` : `主 ${fmt1(mainTps)} tok/s`;
@@ -197,11 +219,16 @@ function stripOfSegments(streams, focus, now) {
 
   // ③ 空闲（含 recent：非生成中一律走水位文案）：首两个有百分比的窗口（≤40 字符约束）
   const name = focus.name ?? focus.providerId;
-  const segs = (focus.windows ?? [])
+  const windows = focus.windows ?? [];
+  const segs = windows
     .filter((w) => typeof w?.percent === "number")
     .slice(0, 2)
     .map((w) => `${WINDOW_SHORT[w.type] ?? w.type} ${Math.round(w.percent)}%`);
-  const text = segs.length > 0 ? `${name} ${segs.join(" · ")}` : name;
+  let text;
+  if (segs.length > 0) text = `${name} ${segs.join(" · ")}`;
+  // 有窗口但全无百分比（官方失败）：不得退化成只剩厂商名的信息悬崖
+  else if (windows.length > 0) text = `${name} 额度不可用`;
+  else text = name;
   // tooltip 同①去掉速率段：全窗口额度头 + 点击引导
   const tooltip = `${quotaHeadOf(focus, now)} · 点击查看详情`;
   return { text, tooltip };
@@ -277,8 +304,15 @@ function vendorsOf(quotaRows, now) {
     const head = windows[0] ?? null;
     const headShort = head === null ? null : WINDOW_SHORT[head.type] ?? head.type;
     const ringPct = typeof head?.percent === "number" ? Math.round(head.percent) : null;
-    // 状态句：紧张态（≥85）加注沿用 V1 口径；无官方时刻给诚实兜底，不编造日期
-    const statusText = head === null ? null : `${headShort} · ${resetText(head.nextResetMs, now, head.type, ringPct !== null && ringPct >= 85)}`;
+    // 状态句：官方失败（无百分比且来源非 official）→「官方接口不可用」，不得把未知伪装成
+    // 滚动窗口；有官方时刻沿用相对/绝对/诚实兜底，≥85 沿用「余量紧张」加注（V1 口径）
+    const unavailable = head !== null && typeof head.percent !== "number" && head.source !== "official";
+    const statusText =
+      head === null
+        ? null
+        : unavailable
+          ? "官方接口不可用"
+          : `${headShort} · ${resetText(head.nextResetMs, now, head.type, ringPct !== null && ringPct >= 85)}`;
     // 副行：官方 resetsAt → 剩余时长；仅 percent → 已用标注；两者皆无的窗口跳过
     const subText =
       windows

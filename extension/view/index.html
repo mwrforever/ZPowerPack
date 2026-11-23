@@ -38,6 +38,7 @@ body::before{content:"";position:fixed;inset:0;background:radial-gradient(60% 34
 .ring{width:44px;height:44px;flex-shrink:0}
 .ring circle{fill:none;stroke-width:3.4}
 .ring .ring-bg{stroke:rgba(140,180,255,.14)}
+.ring.ring-empty .ring-bg{opacity:.55}
 .ring .ring-fg{stroke-linecap:round;transition:stroke-dasharray .3s ease,stroke .3s ease}
 .v-info{min-width:0;flex:1}
 .v-name{font-size:14px;font-weight:700;color:#e8edf6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -64,7 +65,7 @@ body::before{content:"";position:fixed;inset:0;background:radial-gradient(60% 34
 .sync-btn .sync-icon{animation:none}
 .sync-btn.busy .sync-icon{animation:spin 1s linear infinite}
 
-/* ===== 数字过渡类：全部数字节点挂 num-t，值变化经 300ms 淡入上屏 ===== */
+/* ===== 数字过渡类：静态数字节点挂 num-t，值变化经 300ms 淡入上屏（动态重建节点不参与）===== */
 .num-t{transition:opacity .3s ease}
 
 /* ===== 功能动画仅两枚：呼吸圆点 + 同步旋转；prefers-reduced-motion 下全部关闭 ===== */
@@ -207,16 +208,22 @@ function renderRate(rate) {
  *  状态句/副行直渲（低水位与紧张态文案均在 view-model 侧定稿，视图不自创）+
  *  右对齐窗口百分比枚举（OpenCode 三枚全量；字段零加工） */
 function vendorRowHtml(v) {
-  var pct = typeof v.ringPct === "number" ? Math.max(0, Math.min(100, v.ringPct)) : 0;
+  // 官方失败时 ringPct=null：空环不得按 0% 画弧（0 是「一点没用」的视觉编码，未知不是 0）
+  var hasPct = typeof v.ringPct === "number";
+  var pct = hasPct ? Math.max(0, Math.min(100, v.ringPct)) : 0;
   var percs = (v.percents || []).map(function (p) {
     var val = typeof p.pct === "number" ? p.pct + "%" : "—";
     return '<span class="perc"><i>' + esc(p.label) + '</i><b class="num-t">' + val + "</b></span>";
   }).join("");
+  // 弧只在有百分比时生成；环底保留但降透明度（未知态的视觉区分）
+  var ring = hasPct
+    ? '<g transform="rotate(-90 22 22)"><circle class="ring-fg" cx="22" cy="22" r="15.9" stroke="' + esc(v.ringColor) +
+      '" style="stroke-dasharray:' + pct + " " + (RING_C - pct) + '"/></g>'
+    : "";
   return '<div class="vendor" data-testid="vendor-row">' +
-    '<svg class="ring" viewBox="0 0 44 44" aria-hidden="true">' +
+    '<svg class="ring' + (hasPct ? "" : " ring-empty") + '" viewBox="0 0 44 44" aria-hidden="true">' +
     '<circle class="ring-bg" cx="22" cy="22" r="15.9"/>' +
-    '<g transform="rotate(-90 22 22)"><circle class="ring-fg" cx="22" cy="22" r="15.9" stroke="' + esc(v.ringColor) +
-    '" style="stroke-dasharray:' + pct + " " + (RING_C - pct) + '"/></g>' +
+    ring +
     "</svg>" +
     '<div class="v-info"><div class="v-name">' + esc(v.name) + "</div>" +
     (v.statusText ? '<div class="v-status num-t">' + esc(v.statusText) + "</div>" : "") +
@@ -266,7 +273,11 @@ var booted = false;
 var lastVendorsJson = "";
 var lastTrendJson = "";
 function render(dm) {
-  if (!dm || !dm.panel) return;
+  if (!dm || !dm.panel) {
+    // 载荷整体畸形（缺 panel 段）：首帧给可读失败文案，不得静默停在「正在连接」
+    if (!booted) el("boot").textContent = "数据不可用…（载荷缺少 panel 段）";
+    return;
+  }
   renderRate(dm.panel.rate);
   var vj = JSON.stringify(dm.panel.vendors);
   if (vj !== lastVendorsJson) { lastVendorsJson = vj; renderVendors(dm.panel.vendors); }
@@ -348,16 +359,25 @@ var inFlight = false;
 function refresh() {
   if (inFlight) return;
   inFlight = true;
-  readDisplay().then(function (dm) {
-    try {
-      render(dm);
-    } catch (e) {
-      // 渲染异常（载荷形状漂移）：首帧遮罩不得错误隐藏，回写可读的失败文案
-      if (!booted) el("boot").textContent = "数据渲染失败…（" + (e && e.message ? e.message : "未知错误") + "）";
-    }
-  }, function (e) {
+  try {
+    // 整条链在 try 内构建：readResource 同步 throw / 返回非 Promise 时 finally 未注册，
+    // 必须在此捕获复位 inFlight，否则轮询永久锁死在「正在连接」且无任何日志
+    readDisplay().then(function (dm) {
+      try {
+        render(dm);
+      } catch (e) {
+        // 渲染异常（载荷形状漂移）：首帧遮罩不得错误隐藏，回写可读的失败文案；
+        // 启动后异常留痕（console.error），画面保持最后真值不假动
+        console.error("[看板] 渲染失败", e);
+        if (!booted) el("boot").textContent = "数据渲染失败…（" + (e && e.message ? e.message : "未知错误") + "）";
+      }
+    }, function (e) {
+      if (!booted) el("boot").textContent = "数据通道连接中…（" + (e && e.message ? e.message : "未知错误") + "）";
+    }).finally(function () { inFlight = false; });
+  } catch (e) {
+    inFlight = false;
     if (!booted) el("boot").textContent = "数据通道连接中…（" + (e && e.message ? e.message : "未知错误") + "）";
-  }).finally(function () { inFlight = false; });
+  }
 }
 
 trySubscribe();
