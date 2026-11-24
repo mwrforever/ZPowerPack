@@ -9,7 +9,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { activate, deactivate, bindOnGenerate } from "../extension/main.js";
-import { createRateBoard, fmtRate, STALE_STREAM_MS, MAX_LIVE_TPS } from "../extension/core/live-rate.mjs";
+import { createRateBoard, fmtRate, LIVE_WARMUP_EVENTS, RETRY_RESET_MS, STALE_STREAM_MS } from "../extension/core/live-rate.mjs";
 
 const ROOT = new URL("..", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
 
@@ -82,42 +82,51 @@ test("fmtRate：1 位小数去尾零；非法数值返回 null", () => {
   assert.equal(fmtRate(undefined), null);
 });
 
-test("速率状态机：首帧只建状态不上屏；第二条 streaming 显示 ~ 估算值；final 显示精值", () => {
+test("速率状态机：开场先展示上一次精值，累计 4 条 streaming 后才切 ~ 估算（万级伪影不上屏）", () => {
   const board = createRateBoard();
-  assert.equal(board.displayFor("s1"), null, "无事件会话不可展示");
-  assert.equal(board.onEvent(ev({ tps: 4666.67 })), false, "首帧窗口仅几毫秒，官方值属伪影，不上屏");
-  assert.equal(board.displayFor("s1"), null);
-  assert.equal(board.onEvent(ev({ tps: 428.66 })), true);
-  assert.equal(board.displayFor("s1"), "~428.7 tok/s", "生成中加 ~ 标注字符估算");
-  assert.equal(board.onEvent(ev({ phase: "final", tps: 120.77 })), true);
-  assert.equal(board.displayFor("s1"), "120.8 tok/s", "停工后是真实 token 精值，不带 ~");
+  board.onEvent(ev({ phase: "final", tps: 120.8 }), 0);
+  assert.equal(board.displayFor("s1", 0), "120.8 tok/s");
+
+  // 新请求开场：前 4 条 streaming 全部不上屏，继续展示上一次精值（即使官方估算上万）
+  for (let i = 1; i <= LIVE_WARMUP_EVENTS; i++) {
+    assert.equal(board.onEvent(ev({ tps: 10000 }), i * 500), false, `第 ${i} 条 warm-up 不上屏`);
+    assert.equal(board.displayFor("s1", i * 500), "120.8 tok/s", "开场继续展示上一次精值");
+  }
+  // 第 5 条（约 +2s）切到实时估算
+  assert.equal(board.onEvent(ev({ tps: 428.66 }), (LIVE_WARMUP_EVENTS + 1) * 500), true);
+  assert.equal(board.displayFor("s1", (LIVE_WARMUP_EVENTS + 1) * 500), "~428.7 tok/s");
+
+  board.onEvent(ev({ phase: "final", tps: 130.4 }), (LIVE_WARMUP_EVENTS + 2) * 500);
+  assert.equal(board.displayFor("s1"), "130.4 tok/s", "final 是真实 token 精值");
 });
 
-test("速率状态机：同请求 streaming 以末次官方推送值为准；多流取均值", () => {
+test("速率状态机：同请求以末次官方推送值为准；多流取均值（新流 warm-up 期间看旧流）", () => {
   const board = createRateBoard();
-  board.onEvent(ev({ requestId: "r1", tps: 100 })); // 首帧，不上屏
-  board.onEvent(ev({ requestId: "r1", tps: 300 }));
-  assert.equal(board.displayFor("s1"), "~300 tok/s");
-  board.onEvent(ev({ requestId: "r2", tps: 500 })); // 新请求首帧，不上屏
-  assert.equal(board.displayFor("s1"), "~300 tok/s");
-  board.onEvent(ev({ requestId: "r2", tps: 500 }));
-  assert.equal(board.displayFor("s1"), "~400 tok/s");
+  for (let i = 0; i <= LIVE_WARMUP_EVENTS; i++) board.onEvent(ev({ requestId: "r1", tps: 300 }), i * 500);
+  assert.equal(board.displayFor("s1", LIVE_WARMUP_EVENTS * 500), "~300 tok/s");
+
+  // r2 开场 4 条：不参与展示，继续显示 r1 的值
+  for (let i = 0; i < LIVE_WARMUP_EVENTS; i++) board.onEvent(ev({ requestId: "r2", tps: 500 }), 3000 + i * 500);
+  assert.equal(board.displayFor("s1", 4500), "~300 tok/s", "r2 尚在 warm-up，不参与展示");
+
+  board.onEvent(ev({ requestId: "r2", tps: 500 }), 3000 + LIVE_WARMUP_EVENTS * 500);
+  assert.equal(board.displayFor("s1", 5000), "~400 tok/s", "r2 过热身后与 r1 取均值");
 });
 
-test("速率状态机：会话隔离；final 后新一轮 streaming 先保留精值，第二帧起换新估算", () => {
+test("速率状态机：会话隔离；final 后新一轮逐条 warm-up 保持上一精值，满 4 条后换新估算", () => {
   const board = createRateBoard();
-  board.onEvent(ev({ sessionId: "s1", tps: 100 }));
-  board.onEvent(ev({ sessionId: "s1", tps: 100 }));
-  board.onEvent(ev({ sessionId: "s2", tps: 200 }));
-  board.onEvent(ev({ sessionId: "s2", tps: 200 }));
-  assert.equal(board.displayFor("s1"), "~100 tok/s");
-  assert.equal(board.displayFor("s2"), "~200 tok/s");
-  board.onEvent(ev({ sessionId: "s1", phase: "final", tps: 90 }));
+  board.onEvent(ev({ sessionId: "s1", phase: "final", tps: 90 }), 0);
+  board.onEvent(ev({ sessionId: "s2", phase: "final", tps: 200 }), 0);
   assert.equal(board.displayFor("s1"), "90 tok/s");
-  board.onEvent(ev({ sessionId: "s1", requestId: "r9", tps: 250 })); // 新一轮首帧：保持上一精值
-  assert.equal(board.displayFor("s1"), "90 tok/s");
-  board.onEvent(ev({ sessionId: "s1", requestId: "r9", tps: 250 }));
-  assert.equal(board.displayFor("s1"), "~250 tok/s");
+  assert.equal(board.displayFor("s2"), "200 tok/s");
+
+  for (let i = 1; i <= LIVE_WARMUP_EVENTS; i++) {
+    board.onEvent(ev({ sessionId: "s1", requestId: "r9", tps: 250 }), i * 500);
+    assert.equal(board.displayFor("s1"), "90 tok/s", `第 ${i} 条 warm-up 保持上一精值`);
+  }
+  board.onEvent(ev({ sessionId: "s1", requestId: "r9", tps: 250 }), (LIVE_WARMUP_EVENTS + 1) * 500);
+  assert.equal(board.displayFor("s1", (LIVE_WARMUP_EVENTS + 1) * 500), "~250 tok/s");
+  assert.equal(board.displayFor("s2"), "200 tok/s", "其他会话不受影响");
 });
 
 test("速率状态机：缺键/非数值速率事件静默忽略（不编造数据）", () => {
@@ -128,37 +137,37 @@ test("速率状态机：缺键/非数值速率事件静默忽略（不编造数�
   assert.equal(board.displayFor("s1"), null);
 });
 
-test("速率状态机：大块分块伪影（>合理上限）不上屏，保持上一合理值/等 final", () => {
+test("速率状态机：请求静默超 3s 视为宿主重试/重置，重新 warm-up 并保留上一精值", () => {
   const board = createRateBoard();
-  board.onEvent(ev({ tps: 100 }), 1000); // 首帧忽略
-  assert.equal(board.onEvent(ev({ tps: 10000 }), 1500), false, "万级估算视为分块伪影");
-  assert.equal(board.displayFor("s1", 1600), null, "没有上一值时不显示伪影");
+  board.onEvent(ev({ phase: "final", tps: 120 }), 0);
+  for (let i = 0; i <= LIVE_WARMUP_EVENTS; i++) board.onEvent(ev({ tps: 150 }), 1000 + i * 500);
+  assert.equal(board.displayFor("s1", 1000 + LIVE_WARMUP_EVENTS * 500), "~150 tok/s");
 
-  board.onEvent(ev({ tps: 120 }), 2000);
-  assert.equal(board.displayFor("s1", 2100), "~120 tok/s");
-  assert.equal(board.onEvent(ev({ tps: MAX_LIVE_TPS + 1 }), 2500), false);
-  assert.equal(board.displayFor("s1", 2600), "~120 tok/s", "保持上一个合理估算");
-
-  board.onEvent(ev({ phase: "final", tps: 130 }), 3000);
-  assert.equal(board.displayFor("s1", 3000), "130 tok/s", "final 精值不受上限过滤影响");
+  // 静默超过阈值后同一 requestId 再推：宿主已清空累计窗口，重新 warm-up，回到上一精值
+  const gapAt = 1000 + LIVE_WARMUP_EVENTS * 500 + RETRY_RESET_MS + 1;
+  assert.equal(board.onEvent(ev({ tps: 10000 }), gapAt), false, "重试首帧不上屏");
+  assert.equal(board.displayFor("s1", gapAt), "120 tok/s", "回到上一精值");
+  for (let i = 1; i < LIVE_WARMUP_EVENTS; i++) board.onEvent(ev({ tps: 10000 }), gapAt + i * 500);
+  assert.equal(board.displayFor("s1", gapAt + (LIVE_WARMUP_EVENTS - 1) * 500), "120 tok/s");
+  board.onEvent(ev({ tps: 140 }), gapAt + LIVE_WARMUP_EVENTS * 500);
+  assert.equal(board.displayFor("s1", gapAt + LIVE_WARMUP_EVENTS * 500), "~140 tok/s");
 });
 
 test("速率状态机：滞留流（取消/失败无 final）超时后不再假装生成中；final 精值永久保留", () => {
   const board = createRateBoard();
-  board.onEvent(ev({ tps: 100 }), 1000); // 首帧忽略
-  board.onEvent(ev({ tps: 120 }), 1500);
-  assert.equal(board.displayFor("s1", 2000), "~120 tok/s");
+  for (let i = 0; i <= LIVE_WARMUP_EVENTS; i++) board.onEvent(ev({ tps: 120 }), i * 500);
+  const liveAt = LIVE_WARMUP_EVENTS * 500;
+  assert.equal(board.displayFor("s1", liveAt), "~120 tok/s");
 
-  const staleAt = 1500 + STALE_STREAM_MS + 1;
+  const staleAt = liveAt + STALE_STREAM_MS + 1;
   assert.equal(board.displayFor("s1", staleAt), null, "滞留且无 final → 隐藏，不显示 ~ 假装在跑");
   board.expire(staleAt);
   assert.equal(board.displayFor("s1", staleAt), null);
 
   // final 精值不受滞留清理影响：停工后「之前的速率」永久保留
   const board2 = createRateBoard();
-  board2.onEvent(ev({ tps: 100 }), 1000);
-  board2.onEvent(ev({ tps: 120 }), 1500);
-  board2.onEvent(ev({ phase: "final", tps: 121 }), 2000);
+  for (let i = 0; i <= LIVE_WARMUP_EVENTS; i++) board2.onEvent(ev({ tps: 120 }), i * 500);
+  board2.onEvent(ev({ phase: "final", tps: 121 }), (LIVE_WARMUP_EVENTS + 1) * 500);
   board2.expire(999999999);
   assert.equal(board2.displayFor("s1", 999999999), "121 tok/s");
 });
@@ -188,41 +197,46 @@ test("activate：生成事件点亮当前会话素条，final 后继续展示之
   await flush();
   calls.slots.length = 0;
 
-  // 只给 s1 推事件：首帧不上屏（防爆点），第二条 streaming 才点亮；s2 保持隐藏
-  listeners.generate(ev({ sessionId: "s1", tps: 4666.67 }), 1000);
-  assert.deepEqual(calls.slots, [], "首帧伪影不上屏");
-  listeners.generate(ev({ sessionId: "s1", tps: 428.66 }), 1100);
+  // 只给 s1 推事件：开场 4 条 streaming 全部不上屏（先展示上一次精值/无历史则隐藏）；第 5 条才点亮
+  for (let i = 0; i < LIVE_WARMUP_EVENTS; i++) {
+    listeners.generate(ev({ sessionId: "s1", tps: 10000 }), 1000 + i * 500);
+    assert.deepEqual(calls.slots, [], `第 ${i + 1} 条 warm-up 不上屏`);
+  }
+  listeners.generate(ev({ sessionId: "s1", tps: 428.66 }), 1000 + LIVE_WARMUP_EVENTS * 500);
   assert.deepEqual(calls.slots, [
     { id: "zpowerpack-mini", patch: { text: "~428.7 tok/s", visible: true }, scope: { sessionId: "s1" } },
   ]);
 
   // final 绕过节流立即上屏（真实 token 精值）；s2 仍隐藏但同值已推过 → 不重复推
   calls.slots.length = 0;
-  listeners.generate(ev({ sessionId: "s1", phase: "final", tps: 120.77 }), 1200);
+  listeners.generate(ev({ sessionId: "s1", phase: "final", tps: 120.77 }), 1000 + (LIVE_WARMUP_EVENTS + 1) * 500);
   assert.deepEqual(calls.slots, [
     { id: "zpowerpack-mini", patch: { text: "120.8 tok/s", visible: true }, scope: { sessionId: "s1" } },
   ]);
 
   // 同一 final 值重复到达 → 去重零推送
   calls.slots.length = 0;
-  listeners.generate(ev({ sessionId: "s1", phase: "final", tps: 120.77 }), 1250);
+  listeners.generate(ev({ sessionId: "s1", phase: "final", tps: 120.77 }), 1000 + (LIVE_WARMUP_EVENTS + 2) * 500);
   assert.equal(calls.slots.length, 0);
   deactivate();
 });
 
-test("activate：streaming 1s 节流只刷一次，final 绕过；首帧不占节流窗口", async () => {
+test("activate：streaming 1s 节流只刷一次，final 绕过；warm-up 事件不占节流窗口", async () => {
   const { ctx, calls, listeners } = makeCtx({ visibleSessions: [{ sessionId: "s1" }] });
   await activate(ctx, { log: () => {} });
   await flush();
   calls.slots.length = 0;
 
-  listeners.generate(ev({ tps: 100 }), 2000); // 首帧：不上屏、不占节流
-  listeners.generate(ev({ tps: 200 }), 2500); // 第二条：立即上屏
-  listeners.generate(ev({ tps: 250 }), 2600); // 1s 内：被节流
-  assert.equal(calls.slots.length, 1, "1s 内第二条可展示事件被节流");
+  // 前 4 条 warm-up：不上屏、不占节流
+  for (let i = 0; i < LIVE_WARMUP_EVENTS; i++) listeners.generate(ev({ tps: 100 }), 2000 + i * 500);
+  // 第 5 条：立即上屏
+  listeners.generate(ev({ tps: 200 }), 2000 + LIVE_WARMUP_EVENTS * 500);
+  // 第 6 条：1s 内被节流
+  listeners.generate(ev({ tps: 250 }), 2000 + LIVE_WARMUP_EVENTS * 500 + 100);
+  assert.equal(calls.slots.length, 1, "1s 内后续可展示事件被节流");
   assert.equal(calls.slots[0].patch.text, "~200 tok/s");
 
-  listeners.generate(ev({ phase: "final", tps: 300 }), 2700);
+  listeners.generate(ev({ phase: "final", tps: 300 }), 2000 + LIVE_WARMUP_EVENTS * 500 + 200);
   assert.equal(calls.slots.length, 2, "final 不受节流约束");
   assert.equal(calls.slots[1].patch.text, "300 tok/s");
   deactivate();
@@ -303,9 +317,9 @@ test("stop/deactivate：退订生成订阅与 workbench 订阅各一次，重复
 // manifest 终局裁剪契约
 // ---------------------------------------------------------------------------
 
-test("manifest：0.3.2、无视图入口、composer.status 单条且命令目标已声明", () => {
+test("manifest：0.3.3、无视图入口、composer.status 单条且命令目标已声明", () => {
   const plugin = JSON.parse(readFileSync(join(ROOT, ".zcode-plugin", "plugin.json"), "utf8"));
-  assert.equal(plugin.version, "0.3.2");
+  assert.equal(plugin.version, "0.3.3");
   assert.equal(plugin.extension.engines.zcode, "^1.4.0");
   assert.ok(!plugin.extension.main.startsWith("/") && !plugin.extension.main.includes(".."), "main 必须是插件根内相对路径");
   assert.equal(plugin.extension.contributes.views, undefined, "详情面板已砍除");

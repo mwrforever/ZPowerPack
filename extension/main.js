@@ -6,7 +6,8 @@
  * - 速率数据源 = 宿主官方 models.onDidGenerate 订阅（官方推送值原样，无平滑/无补帧）；
  *   宿主只推送 querySource=main_turn 的请求，子代理请求在宿主侧被过滤，故只展示主代理速率；
  * - 生成中显示官方字符估算值并加 `~`（宿主按 chunk 字符数÷3 估 token，实测偏差 -26%~+26%）；
- *   每个请求首帧只建状态不上屏（首帧窗口仅几毫秒，官方值会爆到数千 tok/s 伪影）；
+ *   开场先展示该会话上一次 final 精值，累计 4 条 streaming（约 2s）后才切到实时估算——
+ *   首帧窗口和大块 reasoning/tool 分块会算出万级伪影，不能一上来就采用；
  * - final 是官方真实 usage token ÷ 生成时长的精值，不带 `~`；停工后继续展示该值（「之前的速率」）；
  * - 作用域 = 当前会话（slots.update 第三参 {sessionId}），多窗口各自看到自己会话的值；
  *   目标会话集合来自 workbench.onDidChange / visibleSessions（宿主实证 API）；
@@ -231,18 +232,18 @@ export async function activate(ctx, opts = {}) {
 
   /**
    * 生成事件入口：状态机直录官方推送值 → 按节流刷新素条。
-   * 首帧 streaming 事件被状态机吞掉（防数百毫秒窗口的数千 tok/s 伪影），不占节流时钟；
+   * 开场 warm-up 事件被状态机吞掉（先展示上一次精值，约 2s 后才切实时估算），不占节流时钟；
    * final 立即刷新（真实 token 速率马上上屏），streaming 1s 内多事件只刷一次。
    * @param {object} ev 宿主事件载荷（sessionId/requestId/model/phase/outputTokensPerSecond）
    * @param {number} [now] 事件到达时刻（缺省取当前时刻；测试可注入）
    */
   const onGenerateEvent = (ev, now = Date.now()) => {
-    // 状态机内部以真实到达时刻记录滞留时钟（now 仅用于推送节流，测试可注入）
+    // 状态机内部以真实到达时刻记录 warm-up/滞留时钟（now 仅用于推送节流，测试可注入）
     const changed = board.onEvent(ev);
     if (typeof ev?.sessionId === "string" && ev.sessionId.length > 0) lastEventSession = ev.sessionId;
     // 任何生成事件都重置滞留看门狗（含 final：同会话可能还有其他在飞流）
     armStaleWatchdog();
-    // 首帧被忽略时不刷新，避免把节流窗口浪费在没有展示值的事件上
+    // warm-up 事件被忽略时不刷新，避免把节流窗口浪费在没有展示值的事件上
     if (ev?.phase === "final" || changed) refresh(now, ev?.phase === "final");
   };
 

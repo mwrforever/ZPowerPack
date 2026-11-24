@@ -1,6 +1,6 @@
 {
   "name": "zpowerpack",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "ZPowerPack：zcode 存储迁移向导与当前会话实时 token 速率常驻条。",
   "author": { "name": "ZPowerPack" },
   "license": "MIT",
