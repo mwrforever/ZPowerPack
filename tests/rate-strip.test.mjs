@@ -9,7 +9,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { activate, deactivate, bindOnGenerate } from "../extension/main.js";
-import { createRateBoard, fmtRate, STALE_STREAM_MS } from "../extension/core/live-rate.mjs";
+import { createRateBoard, fmtRate, STALE_STREAM_MS, MAX_LIVE_TPS } from "../extension/core/live-rate.mjs";
 
 const ROOT = new URL("..", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
 
@@ -126,6 +126,21 @@ test("速率状态机：缺键/非数值速率事件静默忽略（不编造数�
   board.onEvent(ev({ tps: Number.NaN }));
   board.onEvent({ sessionId: "s1", requestId: "r1", phase: "streaming", outputTokensPerSecond: "428" });
   assert.equal(board.displayFor("s1"), null);
+});
+
+test("速率状态机：大块分块伪影（>合理上限）不上屏，保持上一合理值/等 final", () => {
+  const board = createRateBoard();
+  board.onEvent(ev({ tps: 100 }), 1000); // 首帧忽略
+  assert.equal(board.onEvent(ev({ tps: 10000 }), 1500), false, "万级估算视为分块伪影");
+  assert.equal(board.displayFor("s1", 1600), null, "没有上一值时不显示伪影");
+
+  board.onEvent(ev({ tps: 120 }), 2000);
+  assert.equal(board.displayFor("s1", 2100), "~120 tok/s");
+  assert.equal(board.onEvent(ev({ tps: MAX_LIVE_TPS + 1 }), 2500), false);
+  assert.equal(board.displayFor("s1", 2600), "~120 tok/s", "保持上一个合理估算");
+
+  board.onEvent(ev({ phase: "final", tps: 130 }), 3000);
+  assert.equal(board.displayFor("s1", 3000), "130 tok/s", "final 精值不受上限过滤影响");
 });
 
 test("速率状态机：滞留流（取消/失败无 final）超时后不再假装生成中；final 精值永久保留", () => {
@@ -288,9 +303,9 @@ test("stop/deactivate：退订生成订阅与 workbench 订阅各一次，重复
 // manifest 终局裁剪契约
 // ---------------------------------------------------------------------------
 
-test("manifest：0.3.1、无视图入口、composer.status 单条且命令目标已声明", () => {
+test("manifest：0.3.2、无视图入口、composer.status 单条且命令目标已声明", () => {
   const plugin = JSON.parse(readFileSync(join(ROOT, ".zcode-plugin", "plugin.json"), "utf8"));
-  assert.equal(plugin.version, "0.3.1");
+  assert.equal(plugin.version, "0.3.2");
   assert.equal(plugin.extension.engines.zcode, "^1.4.0");
   assert.ok(!plugin.extension.main.startsWith("/") && !plugin.extension.main.includes(".."), "main 必须是插件根内相对路径");
   assert.equal(plugin.extension.contributes.views, undefined, "详情面板已砍除");

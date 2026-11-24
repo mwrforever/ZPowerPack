@@ -10,6 +10,8 @@
  *   ÷3 估算 token，实测与真实 token 速率偏差约 -26%~+26%，内容相关）；
  * - 首帧过滤：每个请求的第一条 streaming 事件只建状态、不上屏——宿主首帧窗口仅几毫秒，
  *   官方值会爆到数千 tok/s（实测 4667 tok/s），属计算伪影，不是真实生成速度；
+ * - 大块伪影过滤：单块 reasoning/tool 字符可达近万，累计估算瞬间超过 MAX_LIVE_TPS，
+ *   这类值不上屏（保持上一个合理值或等 final），避免「突然跳出一万多」；
  * - 主代理停工（final）：官方按真实 usage token ÷ 生成时长给值，保留为该会话末值，
  *   素条展示「之前的速率」且不带 `~`（精值）；
  * - 滞留流守卫：取消/失败请求可能收不到 final（宿主推送泵只在完成指标到达时发 final），
@@ -19,6 +21,14 @@
 
 /** 滞留流判定阈值（毫秒）：生成期宿主推送间隔 ≤1.5s，60s 静默必已结束/丢失 */
 export const STALE_STREAM_MS = 60000;
+
+/**
+ * 生成中估算值的合理上限（tok/s）：超过即视为分块伪影，不上屏。
+ * 依据（2026-11-24 真机校准）：宿主 streaming = chunk 字符数÷3÷毫秒，大块 reasoning/tool
+ * 分块（实测单块近 1 万字符）在 500ms 窗口内可算出 1 万+ tok/s；本机近 30 天全部合法
+ * final 上限约 1003 tok/s（deepseek-flash）/878（GLM-5.3），2000 留足余量。
+ */
+export const MAX_LIVE_TPS = 2000;
 
 /** 速率文案精度：1 位小数并去掉尾随 0（428.6、300），与宿主数字字体观感一致 */
 export function fmtRate(n) {
@@ -76,6 +86,9 @@ export function createRateBoard() {
           state.started.add(requestId);
           return false;
         }
+        // 大块 reasoning/tool 分块造成的累计估算尖峰（实测 1 万+ tok/s）不是真实速率——
+        // 不上屏，保留上一合理值；短请求最终由 final 精值收口
+        if (tps > MAX_LIVE_TPS) return false;
         state.active.set(requestId, { tps, at: now });
         return true;
       }

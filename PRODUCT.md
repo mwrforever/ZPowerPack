@@ -34,6 +34,7 @@ zcode 界面内部有流式速率，但插件 API 只向扩展推送 `querySourc
 - 素条值契约：`{text≤40, tooltip≤200, visible, badge}`；渲染组件过滤空 text、`visible:false` 隐藏；插件无样式/颜色/动效控制权
 - 速率文案：生成中 `~428 tok/s`（宿主字符估算，前缀 `~` 明示非精值；每请求首帧不上屏防伪影）；停工后 `120.8 tok/s`（官方真实 usage token 精值，不带 `~`）
 - 滞留守卫：取消/失败请求收不到 final 时，60s 静默后清除「生成中」状态（一次性看门狗，unref；stop 时清理），不长期显示 `~`
+- 伪影上限：streaming 估算值 > 2000 tok/s 视为大块 reasoning/tool 分块造成的伪影，不上屏（保持上一合理值；final 精值不受影响）
 - 为空不展示：会话自激活以来无事件 → `visible:false`，不显示占位文案
 - 事件推送节流 1s（final 绕过）；同会话同值去重；宿主拒收不写去重键
 - 插槽条目必须挂命令目标（宿主 schema 硬约束）→ 保留空操作命令 `zpowerpack-rate-status`
