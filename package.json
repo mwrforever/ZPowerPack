@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "ZPowerPack 插件源码工程：存储迁移向导 + 用量看板（测试与 lint 用）",
+  "description": "ZPowerPack 插件源码工程：存储迁移向导 + 当前会话实时 token 速率素条（测试与 lint 用）",
   "scripts": {
     "test": "node --test",
     "lint": "node scripts/lint.mjs",

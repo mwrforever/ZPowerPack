@@ -1,5 +1,7 @@
 # ZPowerPack 看板 V2 重设计 Implementation Plan
 
+> **⚠ 已作废（2026-11-23 终局裁剪）**：用户最终拍板只保留「当前会话主代理实时 token 速率」素条，额度/趋势/结论/面板/同步全部砍除。本计划的任务分解（T1-T9）不再执行；终局实现见设计稿 §十一，实际代码 = `extension/main.js` + `extension/core/live-rate.mjs` + `tests/rate-strip.test.mjs`。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 按 AI Usage Widget 卡片形态重写看板（厂商行环形水位 + 实时速率 + 24h 趋势 + 结论句 + 手动同步），速率改走官方 `models.onDidGenerate` 流式事件，额度 60s 自动拉取，composer 素条为唯一入口，取数全推送、零逐秒全量扫描。

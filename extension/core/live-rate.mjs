@@ -1,137 +1,131 @@
 /**
- * 实时速率状态机：官方 models.onDidGenerate 流式事件驱动（纯内存，无 IO、无定时器）。
+ * 当前会话实时 token 速率状态机（v0.3 最小口径，纯内存、无 IO、无定时器）。
  *
- * V2 口径（取代旧 rate.mjs 的 EMA/窗口加权/三态保持）：
- * - 展示值=官方推送值原样，本模块不做任何平滑/加权/保持；
- * - 活跃流 Map<requestId, 流>：streaming 事件建流/刷新，final 事件删流并记 lastFinal；
- * - 三态判定：存在 streaming 流 → live；最近事件距今 ≤ IDLE_AFTER_MS → recent；超 → idle
- *   （recent/idle 的末值由 lastFinal 原样带出，视图据此展示数据时刻速率而非 0）；
- * - requestTps 自 rate.mjs 原样迁入（订阅不可达兜底链与降级路径共用）。
+ * 数据源：宿主官方 models.onDidGenerate 流式事件（载荷 outputTokensPerSecond 为官方算好的
+ * 实时速率，直接采用，不做 EMA/窗口加权/平滑）。宿主只推送 querySource=main_turn 的请求，
+ * 子代理请求在宿主侧被过滤，故本模块只维护主代理流。
  *
- * 事件载荷键名契约（camelCase 基线；Task 0 真机探针实测如有出入，由控制者安排映射调整）：
- * {sessionId, requestId, model:{providerId, modelId}, phase:"streaming"|"final",
- *  outputTokensPerSecond, outputTokens?, timeToFirstTokenMs?}
+ * 展示口径（2026-11-23 用户终局裁剪；2026-11-24 实测校准）：
+ * - 生成中：活跃流速率均值的官方估算值，前缀 `~` 表示「字符估算」（宿主按 chunk 字符数
+ *   ÷3 估算 token，实测与真实 token 速率偏差约 -26%~+26%，内容相关）；
+ * - 首帧过滤：每个请求的第一条 streaming 事件只建状态、不上屏——宿主首帧窗口仅几毫秒，
+ *   官方值会爆到数千 tok/s（实测 4667 tok/s），属计算伪影，不是真实生成速度；
+ * - 主代理停工（final）：官方按真实 usage token ÷ 生成时长给值，保留为该会话末值，
+ *   素条展示「之前的速率」且不带 `~`（精值）；
+ * - 滞留流守卫：取消/失败请求可能收不到 final（宿主推送泵只在完成指标到达时发 final），
+ *   活跃流静默超过 STALE_STREAM_MS 即视为结束——不再显示 `~` 假装仍在生成；
+ * - 会话从未产生事件：displayFor 返回 null，调用方隐藏素条，不展示占位文案。
  */
 
-/** 空闲判定阈值（毫秒）：无流且最近事件距今超过该值 → idle（沿用旧保持上限 5 分钟口径） */
-const IDLE_AFTER_MS = 300000;
+/** 滞留流判定阈值（毫秒）：生成期宿主推送间隔 ≤1.5s，60s 静默必已结束/丢失 */
+export const STALE_STREAM_MS = 60000;
 
-/** 数值保留 2 位小数（requestTps 展示口径，迁移自 rate.mjs 不改动） */
-function round2(n) {
-  return Math.round(n * 100) / 100;
+/** 速率文案精度：1 位小数并去掉尾随 0（428.6、300），与宿主数字字体观感一致 */
+export function fmtRate(n) {
+  if (typeof n !== "number" || !Number.isFinite(n)) return null;
+  const v = Math.round(n * 10) / 10;
+  return Number.isInteger(v) ? String(v) : v.toFixed(1);
 }
 
 /**
- * 单请求生成速率（token 每秒）——自 rate.mjs 原样迁入，订阅兜底链共用。
- * @param {object} row db-reader 输出的 camelCase 行
- * @returns {number|null} tps 保留 2 位；非 completed / 分母≤0 / 产出缺失 → null
- */
-export function requestTps(row) {
-  if (!row || row.status !== "completed") return null;
-  const output = (row.outputTokens ?? 0) + (row.reasoningTokens ?? 0);
-  if (!(output > 0)) return null;
-  // 分母：优先 first_token_at→completed_at 的真实生成段；缺失时兜底 duration_ms（含 TTFT，口径稍粗）
-  let genMs = null;
-  if (typeof row.firstTokenAt === "number" && typeof row.completedAt === "number") {
-    genMs = row.completedAt - row.firstTokenAt;
-  } else if (typeof row.durationMs === "number") {
-    genMs = row.durationMs;
-  }
-  if (!(genMs > 0)) return null;
-  return round2((output / genMs) * 1000);
-}
-
-/**
- * 创建实时速率状态机实例（每个看板服务一份，单线程事件循环内使用，无并发风险）。
+ * 创建速率状态机（每个扩展激活一份；宿主单线程事件循环，无并发风险）。
  * @returns {{
- *   onEvent(ev: object, now: number, subagentIds: Set<string>): void,
- *   snapshot(now: number): object,
- *   noteFallbackRow(row: object): void
- * }} onEvent=事件入口（now 为事件到达时刻，epoch 毫秒）；
- *     snapshot=当前快照（now 为取快照时刻）；
- *     noteFallbackRow=订阅不可达兜底入口
+ *   onEvent(ev: object, now?: number): boolean,
+ *   displayFor(sessionId: string, now?: number): string|null,
+ *   expire(now?: number): void
+ * }} onEvent=官方生成事件入口（返回 true 表示展示值可能变化，调用方据此触发素条刷新）；
+ *     displayFor=按会话取素条文案（无任何数据/全部流滞留 → null）；
+ *     expire=清理滞留流（调用方看门狗定时调用）
  */
-export function createLiveRate() {
-  /** 活跃流：Map<requestId, {requestId, modelId, providerId, isSub, tps, phase}>（phase 恒为 streaming，final 即删） */
-  const streams = new Map();
-  let lastEventAt = null; // 最近事件时刻（epoch 毫秒，任意 phase，recent/idle 判定时钟）
-  let lastProviderId = null; // 最近事件厂商（素条空闲态「跟随最近请求厂商」用）
-  let lastFinal = null; // 最近 final 末值 {modelId, tps, outputTokens, at} | null
-  let fallback = null; // 兜底 {tps, completedAt} | null（noteFallbackRow 写入）
+export function createRateBoard() {
+  /**
+   * 会话状态：sessionId → {active: Map<requestId, {tps, at}>, started: Set<requestId>, last: number|null}
+   * started=已见过首帧的请求（首帧只登记不上屏，防爆点）；last=最近 final 的真实速率；
+   * at=该流末次事件时刻（滞留判定）。
+   */
+  const sessions = new Map();
+
+  /** 过滤滞留流（不删除）：now 与流末次事件相距超过阈值即视为已结束 */
+  const freshStreams = (state, now) =>
+    [...state.active.values()].filter((s) => now - s.at <= STALE_STREAM_MS);
 
   return {
     /**
-     * 事件入口：官方推送载荷直录，不做平滑。
-     * @param {object} ev camelCase 契约载荷（键名见模块头注释）
-     * @param {number} now 事件到达时刻（epoch 毫秒，宿主回调到达时间）
-     * @param {Set<string>} subagentIds Task 1 subagentSessionIds 产出的子代理会话集合（空集=全部按主会话）
+     * 官方生成事件入口：载荷直录，不做平滑与补帧。
+     * @param {object} ev 宿主事件载荷（键名契约：sessionId/requestId/phase/outputTokensPerSecond）
+     * @param {number} [now] 事件到达时刻（缺省当前时刻；滞留判定用）
+     * @returns {boolean} true=展示值可能变化（调用方需要刷新素条）；false=脏数据/首帧/未知状态
      */
-    onEvent(ev, now, subagentIds) {
-      // 最近事件信息每次全量刷新（素条空闲态跟随、三态判定共用同一时钟）
-      lastEventAt = now;
-      lastProviderId = ev.model.providerId;
+    onEvent(ev, now = Date.now()) {
+      const sessionId = ev?.sessionId;
+      const requestId = ev?.requestId;
+      const tps = ev?.outputTokensPerSecond;
+      if (typeof sessionId !== "string" || sessionId.length === 0) return false;
+      if (typeof requestId !== "string" || requestId.length === 0) return false;
+      if (typeof tps !== "number" || !Number.isFinite(tps) || tps < 0) return false;
 
-      if (ev.phase === "streaming") {
-        // 建流/刷新：同 requestId 重复推送以末次为准（官方持续推送瞬时速率）
-        streams.set(ev.requestId, {
-          requestId: ev.requestId,
-          modelId: ev.model.modelId,
-          providerId: ev.model.providerId,
-          // isSub 由会话归属判定：子代理速率单独分列（subTps）
-          isSub: subagentIds.has(ev.sessionId),
-          tps: ev.outputTokensPerSecond,
-          phase: "streaming",
-        });
-        return;
+      let state = sessions.get(sessionId);
+      if (!state) {
+        state = { active: new Map(), started: new Set(), last: null };
+        sessions.set(sessionId, state);
       }
-      // final 收流：删流并记末值；漏 final 导致的滞留流属宿主事件丢失，本层不补偿
-      streams.delete(ev.requestId);
-      lastFinal = {
-        modelId: ev.model.modelId,
-        tps: ev.outputTokensPerSecond,
-        outputTokens: ev.outputTokens ?? null, // 契约中 final 才带产出，缺失时置 null 保形稳定
-        at: now,
-      };
+      // streaming：同一 requestId 以末次官方推送值为准（官方持续推送累计平均速率）
+      if (ev?.phase === "streaming") {
+        // 首帧窗口只有几毫秒，官方 chars/3 值会爆到数千 tok/s（实测伪影）——只登记不上屏
+        if (!state.started.has(requestId)) {
+          state.started.add(requestId);
+          return false;
+        }
+        state.active.set(requestId, { tps, at: now });
+        return true;
+      }
+      // final：收流并记真实速率——主代理停工后素条继续展示该值（「之前的速率」精值）
+      if (ev?.phase === "final") {
+        state.started.delete(requestId);
+        state.active.delete(requestId);
+        state.last = tps;
+        return true;
+      }
+      return false;
     },
 
     /**
-     * 当前快照（渲染契约，Task 4/5 消费）。
-     * @param {number} now 取快照时刻（epoch 毫秒）
-     * @returns {{state: "live"|"recent"|"idle", streams: object[], totalTps: number, subTps: number,
-     *            lastEventAt: number|null, lastProviderId: string|null,
-     *            lastFinal: {modelId, tps, outputTokens, at}|null, fallback: {tps, completedAt}|null}}
-     *          state=live 时速率按流给；recent/idle 无流但末值在 lastFinal（不显示 0）；
-     *          fallback 与流并存时流优先（由 state=live 表达），兜底行不参与状态判定
+     * 按会话取素条展示文案（本插件唯一展示契约）。
+     * @param {string} sessionId 会话 id（宿主 slots.update 会话作用域键）
+     * @param {number} [now] 渲染时刻（缺省当前时刻；用于剔除滞留流）
+     * @returns {string|null} 生成中「~428 tok/s」（字符估算）；停工后「120.8 tok/s」（真实 token）；
+     *          null=该会话从未收到事件或全部流已滞留且无 final（素条须隐藏）
      */
-    snapshot(now) {
-      const rows = [...streams.values()];
-      // 三态判定：有流即 live；无流按最近事件时刻判 recent/idle（兜底行不参与判定）
-      let state;
-      if (rows.length > 0) {
-        state = "live";
-      } else if (lastEventAt !== null && now - lastEventAt <= IDLE_AFTER_MS) {
-        state = "recent";
-      } else {
-        state = "idle";
+    displayFor(sessionId, now = Date.now()) {
+      const state = sessions.get(sessionId);
+      if (!state) return null;
+      // 生成中：未滞留活跃流的均值（单流即原值；多流为防御性口径），`~` 标注字符估算
+      const live = freshStreams(state, now);
+      if (live.length > 0) {
+        let sum = 0;
+        for (const s of live) sum += s.tps;
+        return `~${fmtRate(sum / live.length)} tok/s`;
       }
-      // 主/子代理分列合计（官方推送值原样求和，无加权）
-      let totalTps = 0;
-      let subTps = 0;
-      for (const s of rows) {
-        totalTps += s.tps;
-        if (s.isSub) subTps += s.tps;
-      }
-      return { state, streams: rows, totalTps, subTps, lastEventAt, lastProviderId, lastFinal, fallback };
+      // 停工后：展示该会话最后一次 final 的真实速率（无 final → 无值可展示）
+      if (state.last !== null) return `${fmtRate(state.last)} tok/s`;
+      return null;
     },
 
     /**
-     * 兜底入口：订阅不可达时由服务层喂最新完成行。
-     * 只存 requestTps(row) 与 completedAt，不参与状态判定（视图按数据时刻渲染）。
-     * @param {object} row db-reader 输出的 camelCase 完成行
+     * 清理滞留流（取消/失败请求收不到 final 时防内存增长）：删除超时活跃流。
+     * @param {number} [now] 当前时刻（缺省当前时刻）
+     * @returns {void}
      */
-    noteFallbackRow(row) {
-      // requestTps 已容 null；completedAt 同样用可选链兜底，row 缺失时置 null 而非抛错
-      fallback = { tps: requestTps(row), completedAt: row?.completedAt ?? null };
+    expire(now = Date.now()) {
+      for (const state of sessions.values()) {
+        for (const [requestId, s] of state.active) {
+          if (now - s.at > STALE_STREAM_MS) {
+            state.active.delete(requestId);
+            // 首帧登记同样清理（该请求已不可能再产生可展示值）
+            state.started.delete(requestId);
+          }
+        }
+      }
     },
   };
 }

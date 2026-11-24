@@ -4,57 +4,62 @@
 
 ## Platform
 
-web（渲染于 ZCode Desktop 的 plugin-sandbox：Electron 内嵌 WebView，非浏览器直开）
+ZCode Desktop 扩展（扩展宿主 Node 进程）+ composer.status 宿主渲染素条；无独立视图、无沙箱页面。
 
 ## Stack
 
-extension 沙箱原生 HTML/CSS/JS + d3 7.9（沙箱 vendor 预置，无框架、零 npm 运行时依赖）；数据层 Node ≥22.5（`node:sqlite`）由扩展宿主提供。
+原生 ESM（`extension/main.js` + `extension/core/live-rate.mjs`），零运行时依赖；测试用 Node `node --test` 与 `node:sqlite`（仅迁移向导）。
 
 ## Users
 
-单一核心用户：ZCode Desktop 重度使用者（开发者本人），在编码工作流中随时打开看板监控自己的模型消耗与套餐余量；盯盘时心态是"扫一眼得到答案"，也会在长会话期间挂着持续观察。
+单一核心用户：ZCode Desktop 重度使用者（开发者本人）。生成过程中扫一眼输入框旁，确认当前会话「现在跑多快」；不盯盘、不需要历史趋势。
 
 ## Product Purpose
 
-ZPowerPack 插件为 zcode 补齐官方未覆盖的可观测能力：实时 token 速率（含平滑保持策略）、模型吞吐对比、TTFT、上下文→速率关系、按项目消耗、工具调用统计、Provider 稳定性、时段热力图、套餐额度窗口（5h/订阅周期，智谱/Kimi/OpenCode/Qwen 保底）。成功 = 打开看板 3 秒内回答"现在跑多快、还剩多少额度"。
+把官方 `models.onDidGenerate` 推送的实时 token 速率（主代理）以常驻素条呈现在当前会话的输入控制台；为空不展示，主代理停工后保留最后速率。成功 = 生成中数字随官方推送跳动，停工后仍是最后值，切换会话各自独立。
 
 ## Positioning
 
-zcode 官方用量页只有消耗类统计；ZPowerPack 独有的机制是：请求级遥测的实时滑动窗口速率（官方无）、按 provider 实例的订阅周期额度对齐（官方无）、以及不解析 21GB JSONL 而直接读官方 db.sqlite 的零成本数据层。
+zcode 界面内部有流式速率，但插件 API 只向扩展推送 `querySource=main_turn` 的事件；ZPowerPack 把这一个官方真值直接落到 composer.status，零轮询、零扫库、零平滑补丁。子代理请求在宿主侧被过滤，插件无法取得其速率（已知边界，不做落库近似）。
 
 ## Operating Context
 
-- 数据源：`db.sqlite`（WAL 只读，1s 轮询增量）；`provider_config.json` + `zcode-builtin.json`（模板目录，CDN 刷新）
-- 渲染环境：plugin-sandbox（预置 d3/lucide/visualize 脚手架；视图侧无 Node API）
-- 双形态：独立全页视图（桌面端导航入口打开）+ 迷你常驻态（速率+额度精简版）
-- 平台：Windows 10/11；中文界面
+- 数据源：`ctx.models.onDidGenerate` 订阅（事件载荷含 sessionId/requestId/phase/outputTokensPerSecond）
+- 承载面：`slots.update("zpowerpack-mini", patch, {sessionId})`，宿主渲染图标 + 一行文本
+- 会话目标：`ctx.workbench.onDidChange` + `visibleSessions()`
+- 平台：Windows 10/11；中文日志与文案；插件同时包含存储迁移向导（skills/scripts），本产品描述只覆盖速率素条
 
 ## Capabilities and Constraints
 
-- 数据契约：`buildSnapshot` 输出的唯一 JSON（rate/quota/charts 三组字段，设计文档 §五 口径）
-- 明确未决：迷你常驻态的宿主承载能力未验证（Plan 2 Task 1 V1），不可行时迷你态降级为会话内 Gen UI 片段
-- 错误行不入速率；held/idle 状态必须可见区分
-- 敏感值（apiKey）不进视图层
+- 素条值契约：`{text≤40, tooltip≤200, visible, badge}`；渲染组件过滤空 text、`visible:false` 隐藏；插件无样式/颜色/动效控制权
+- 速率文案：生成中 `~428 tok/s`（宿主字符估算，前缀 `~` 明示非精值；每请求首帧不上屏防伪影）；停工后 `120.8 tok/s`（官方真实 usage token 精值，不带 `~`）
+- 滞留守卫：取消/失败请求收不到 final 时，60s 静默后清除「生成中」状态（一次性看门狗，unref；stop 时清理），不长期显示 `~`
+- 为空不展示：会话自激活以来无事件 → `visible:false`，不显示占位文案
+- 事件推送节流 1s（final 绕过）；同会话同值去重；宿主拒收不写去重键
+- 插槽条目必须挂命令目标（宿主 schema 硬约束）→ 保留空操作命令 `zpowerpack-rate-status`
+- 子代理实时速率不可得（宿主只推 main_turn，带 parentToolCallId 的 chunk 被丢弃）
+- 无 db 读取、无额度接口、无定时器、无视图注册；apiKey 等敏感值完全不在本功能数据面内
 
 ## Brand Commitments
 
-- 视觉方向由用户明确钉死：**高级炫酷的暗色流光样式**，要求微交互效果与数值变动动画
-- 名称：ZPowerPack；界面语言中文（数字/单位/模型名保持原样）
+- 无自定义视觉：完全跟随宿主 composer.status 的 ghost 按钮样式（图标 + 等宽数字文本）
+- 名称：ZPowerPack；文案中文（数字/单位保持原样）
+- 不做主题化装饰、不做 badge（渲染侧不消费）
 
 ## Evidence on Hand
 
-- 真实数据结构：db.sqlite model_usage/turn_usage/tool_usage/session 表（设计文档 E1 字段清单）
-- 真实 provider 配置样例（脱敏）与 34 个模板目录（E6）
-- 真实速率样本：单请求 tps=108.21（output=303, 生成时长 2800ms）
+- 真机探针：`~/.zcode/cli/zpowerpack/v2-probe-diagnostics.json`（订阅形态 `ctx.models.onDidGenerate()` 绑定成功；事件键与实现一致；推送间隔 500-1500ms）
+- 宿主源码：`out/host/index.js` 推送泵（`Rde="main_turn"`、`parentToolCallId` 过滤）；`out/main/chunk-2BVCDB7Q.js` 插槽 zod 契约与渲染过滤
+- 仓库测试：`tests/rate-strip.test.mjs`（状态机/接线/manifest）
 
 ## Product Principles
 
-1. 盯盘三秒原则：首屏必须直接回答"现在多快/还剩多少"，任何点击不得是前置条件
-2. 真实数据永远优先于装饰；held/idle 状态宁可诚实也不美化
-3. 原生感：跟随桌面端暗色环境，但流光个性必须存在
-4. 每个数字可溯源：视图上任何值都能对应到 db 字段或配置项
+1. 只展示官方真值：不做 EMA、窗口加权、持仓保持或补帧
+2. 没有数据就不出现：空态隐藏，不编造「待机」文案
+3. 零后台负担：无定时器、无 db 扫描、无网络请求，只在事件到达时更新内存与素条
+4. 诚实边界：子代理速率拿不到就不显示，不拿落库行冒充实时
 
 ## Accessibility & Inclusion
 
-- 速率保持（held）与空闲（idle）不能仅靠颜色区分，需文字标注
-- 数值动画不得遮挡数字本体可读性；动效尊重系统减少动态偏好（prefers-reduced-motion 降级为直接跳变）
+- 文本由宿主渲染，字号/对比度/紧凑模式跟随宿主设置
+- 只依赖宿主自带的数字等宽与截断行为，不引入动画（无 prefers-reduced-motion 关注点）
